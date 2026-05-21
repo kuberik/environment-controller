@@ -98,6 +98,15 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, fmt.Errorf("unsupported backend: %s", deployment.Spec.Backend.Type)
 	}
 
+	// Create or update RolloutGate before any GitHub API calls. The gate starts
+	// blocking immediately (allowedVersions=[]) when a relationship is configured,
+	// so the rollout controller cannot deploy to this environment before the gate
+	// has been populated with versions that passed the upstream environment.
+	if err := r.createOrUpdateRolloutGate(ctx, deployment); err != nil {
+		log.Error(err, "Failed to create or update RolloutGate")
+		return ctrl.Result{}, err
+	}
+
 	// Get the referenced Rollout to get the current version
 	rollout, err := r.getReferencedRollout(ctx, deployment)
 	if err != nil {
@@ -128,12 +137,6 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	// Calculate and update Status
 	if err := r.updateStatus(ctx, deployment, graphData); err != nil {
 		log.Error(err, "Failed to update Environment status")
-		return ctrl.Result{}, err
-	}
-
-	// Create or update RolloutGate
-	if err := r.createOrUpdateRolloutGate(ctx, deployment); err != nil {
-		log.Error(err, "Failed to create or update RolloutGate")
 		return ctrl.Result{}, err
 	}
 
@@ -1177,6 +1180,16 @@ func (r *GitHubEnvironmentReconciler) applyRolloutGateDesiredState(rolloutGate *
 
 	// Set spec
 	rolloutGate.Spec.RolloutRef = &deployment.Spec.RolloutRef
+
+	// When a relationship is configured, initialize AllowedVersions to an empty
+	// slice (not nil) so the gate blocks all versions by default until
+	// updateAllowedVersionsFromRelationships populates it. A nil AllowedVersions
+	// is treated by the rollout controller as "no restriction", which would allow
+	// deployments to race through before the gate is fully set up.
+	if deployment.Spec.Relationship != nil && rolloutGate.Spec.AllowedVersions == nil {
+		empty := []string{}
+		rolloutGate.Spec.AllowedVersions = &empty
+	}
 
 	// Set owner reference
 	if err := ctrl.SetControllerReference(deployment, rolloutGate, r.Scheme); err != nil {

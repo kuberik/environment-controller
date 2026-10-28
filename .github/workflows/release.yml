@@ -31,5 +31,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body_path: CHANGELOG-current.md
+          # A tag with a pre-release suffix (v0.2.0-rc.0, v1.0.0-beta.2) must
+          # not be published as a normal release: GitHub would show it as
+          # "Latest" and anyone following the repo's releases would take a
+          # release candidate for the stable one. SemVer puts that suffix
+          # after a hyphen, and a plain release tag never contains one.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/install.yaml

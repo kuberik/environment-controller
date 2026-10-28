@@ -84,11 +84,8 @@ var _ = Describe("Environment Controller", func() {
 		// Delete each deployment
 		for _, deployment := range deployments {
 			if deployment.ID != nil {
-				// Actually delete the deployment
-				_, err = client.Repositories.DeleteDeployment(context.Background(), owner, repo, *deployment.ID)
-				if err != nil {
-					// Ignore deletion errors during cleanup
-				}
+				// Actually delete the deployment, ignoring deletion errors during cleanup
+				_, _ = client.Repositories.DeleteDeployment(context.Background(), owner, repo, *deployment.ID)
 			}
 		}
 	}
@@ -125,7 +122,7 @@ var _ = Describe("Environment Controller", func() {
 		}
 
 		// Delete if exists first
-		k8sClient.Delete(context.Background(), secret)
+		_ = k8sClient.Delete(context.Background(), secret)
 		return k8sClient.Create(context.Background(), secret)
 	}
 
@@ -143,7 +140,7 @@ var _ = Describe("Environment Controller", func() {
 		deploymentList := &kuberikv1alpha1.EnvironmentList{}
 		if err := k8sClient.List(context.Background(), deploymentList); err == nil {
 			for i := range deploymentList.Items {
-				k8sClient.Delete(context.Background(), &deploymentList.Items[i])
+				_ = k8sClient.Delete(context.Background(), &deploymentList.Items[i])
 			}
 		}
 	})
@@ -156,15 +153,15 @@ var _ = Describe("Environment Controller", func() {
 			})
 
 			It("Should fallback to POD_NAMESPACE environment variable", func() {
-				os.Setenv("POD_NAMESPACE", "test-namespace")
-				defer os.Unsetenv("POD_NAMESPACE")
+				Expect(os.Setenv("POD_NAMESPACE", "test-namespace")).To(Succeed())
+				DeferCleanup(os.Unsetenv, "POD_NAMESPACE")
 				result := reconciler.getControllerNamespace()
 				Expect(result).To(Equal("test-namespace"))
 			})
 
 			It("Should return empty string when no namespace is available", func() {
-				os.Unsetenv("POD_NAMESPACE")
-				os.Unsetenv("WATCH_NAMESPACE")
+				Expect(os.Unsetenv("POD_NAMESPACE")).To(Succeed())
+				Expect(os.Unsetenv("WATCH_NAMESPACE")).To(Succeed())
 				result := reconciler.getControllerNamespace()
 				// In test environment, this might return empty or might read from actual file
 				// So we just check it's a valid string (empty or actual namespace)
@@ -181,7 +178,7 @@ var _ = Describe("Environment Controller", func() {
 
 			BeforeEach(func() {
 				// Set controller namespace via environment variable
-				os.Setenv("POD_NAMESPACE", ControllerNamespace)
+				Expect(os.Setenv("POD_NAMESPACE", ControllerNamespace)).To(Succeed())
 
 				// Create the controller namespace
 				ns := &corev1.Namespace{
@@ -190,11 +187,11 @@ var _ = Describe("Environment Controller", func() {
 					},
 				}
 				// Ignore error if namespace already exists
-				k8sClient.Create(context.Background(), ns)
+				_ = k8sClient.Create(context.Background(), ns)
 			})
 
 			AfterEach(func() {
-				os.Unsetenv("POD_NAMESPACE")
+				Expect(os.Unsetenv("POD_NAMESPACE")).To(Succeed())
 				// Clean up test resources
 				svc := &corev1.Service{
 					ObjectMeta: metav1.ObjectMeta{
@@ -202,7 +199,7 @@ var _ = Describe("Environment Controller", func() {
 						Namespace: ControllerNamespace,
 					},
 				}
-				k8sClient.Delete(context.Background(), svc)
+				_ = k8sClient.Delete(context.Background(), svc)
 
 				ingress := &networkingv1.Ingress{
 					ObjectMeta: metav1.ObjectMeta{
@@ -210,7 +207,7 @@ var _ = Describe("Environment Controller", func() {
 						Namespace: ControllerNamespace,
 					},
 				}
-				k8sClient.Delete(context.Background(), ingress)
+				_ = k8sClient.Delete(context.Background(), ingress)
 
 				httpRoute := &gatewayv1.HTTPRoute{
 					ObjectMeta: metav1.ObjectMeta{
@@ -218,7 +215,7 @@ var _ = Describe("Environment Controller", func() {
 						Namespace: ControllerNamespace,
 					},
 				}
-				k8sClient.Delete(context.Background(), httpRoute)
+				_ = k8sClient.Delete(context.Background(), httpRoute)
 
 				gateway := &gatewayv1.Gateway{
 					ObjectMeta: metav1.ObjectMeta{
@@ -226,7 +223,7 @@ var _ = Describe("Environment Controller", func() {
 						Namespace: ControllerNamespace,
 					},
 				}
-				k8sClient.Delete(context.Background(), gateway)
+				_ = k8sClient.Delete(context.Background(), gateway)
 			})
 
 			It("Should return empty string when service doesn't exist", func() {
@@ -407,7 +404,7 @@ var _ = Describe("Environment Controller", func() {
 			})
 
 			It("Should return empty string when controller namespace cannot be determined", func() {
-				os.Unsetenv("POD_NAMESPACE")
+				Expect(os.Unsetenv("POD_NAMESPACE")).To(Succeed())
 				url := reconciler.getRolloutDashboardURL(context.Background(), TestNamespace, TestName)
 				Expect(url).To(BeEmpty())
 			})
@@ -928,7 +925,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			// Update the rollout to set the status
@@ -967,7 +964,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -1086,7 +1083,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			// Update the rollout to set the status
@@ -1123,7 +1120,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -1202,7 +1199,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			// Update the rollout to set the status
@@ -1239,7 +1236,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -1317,7 +1314,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -1365,7 +1362,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			By("Creating Deployment")
@@ -1387,7 +1384,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -1426,7 +1423,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			By("Creating Deployment")
@@ -1448,7 +1445,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -1497,7 +1494,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			// Update the rollout to set the status
@@ -1534,7 +1531,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -1629,7 +1626,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			rollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -1676,7 +1673,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment with relationship")
@@ -1731,7 +1728,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			rollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -1775,7 +1772,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -1888,7 +1885,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			rollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -1928,7 +1925,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -1962,7 +1959,7 @@ var _ = Describe("Environment Controller", func() {
 			Expect(stagingInfo.History).ToNot(BeEmpty())
 
 			// Should track staging version since it's related
-			Expect(len(stagingInfo.History)).To(BeNumerically(">=", 1))
+			Expect(stagingInfo.History).ToNot(BeEmpty())
 
 			// Verify staging version is tracked
 			stagingVersionFound := false
@@ -1995,7 +1992,7 @@ var _ = Describe("Environment Controller", func() {
 					},
 				},
 			}
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			rollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -2030,7 +2027,7 @@ var _ = Describe("Environment Controller", func() {
 					Environment: "production",
 				},
 			}
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment - first time")
@@ -2060,7 +2057,7 @@ var _ = Describe("Environment Controller", func() {
 				}
 			}
 			Expect(productionInfo).ToNot(BeNil())
-			Expect(len(productionInfo.History)).To(BeNumerically(">=", 1))
+			Expect(productionInfo.History).ToNot(BeEmpty())
 
 			revision1Found := false
 			for _, entry := range productionInfo.History {
@@ -2162,7 +2159,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			rollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -2206,7 +2203,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment - first time with both versions")
@@ -2347,7 +2344,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			rollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -2387,7 +2384,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -2418,7 +2415,7 @@ var _ = Describe("Environment Controller", func() {
 				}
 			}
 			Expect(productionInfo).ToNot(BeNil())
-			Expect(len(productionInfo.History)).To(BeNumerically(">=", 1))
+			Expect(productionInfo.History).ToNot(BeEmpty())
 
 			// Should have status entries for staging (related environment)
 			var stagingInfo *kuberikv1alpha1.EnvironmentInfo
@@ -2430,7 +2427,7 @@ var _ = Describe("Environment Controller", func() {
 			}
 			Expect(stagingInfo).ToNot(BeNil())
 			Expect(stagingInfo.History).ToNot(BeEmpty())
-			Expect(len(stagingInfo.History)).To(BeNumerically(">=", 1))
+			Expect(stagingInfo.History).ToNot(BeEmpty())
 
 			// Verify staging status entry has correct information
 			stagingVersionFound := false
@@ -2463,7 +2460,7 @@ var _ = Describe("Environment Controller", func() {
 					},
 				},
 			}
-			k8sClient.Delete(context.Background(), stagingRollout)
+			_ = k8sClient.Delete(context.Background(), stagingRollout)
 			Expect(k8sClient.Create(context.Background(), stagingRollout)).Should(Succeed())
 
 			stagingRollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -2499,7 +2496,7 @@ var _ = Describe("Environment Controller", func() {
 					Environment: "staging",
 				},
 			}
-			k8sClient.Delete(context.Background(), stagingEnv)
+			_ = k8sClient.Delete(context.Background(), stagingEnv)
 			Expect(k8sClient.Create(context.Background(), stagingEnv)).Should(Succeed())
 
 			By("Creating production Rollout")
@@ -2515,7 +2512,7 @@ var _ = Describe("Environment Controller", func() {
 					},
 				},
 			}
-			k8sClient.Delete(context.Background(), productionRollout)
+			_ = k8sClient.Delete(context.Background(), productionRollout)
 			Expect(k8sClient.Create(context.Background(), productionRollout)).Should(Succeed())
 
 			productionRollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -2554,7 +2551,7 @@ var _ = Describe("Environment Controller", func() {
 					},
 				},
 			}
-			k8sClient.Delete(context.Background(), productionEnv)
+			_ = k8sClient.Delete(context.Background(), productionEnv)
 			Expect(k8sClient.Create(context.Background(), productionEnv)).Should(Succeed())
 
 			By("Reconciling production Environment")
@@ -2585,7 +2582,7 @@ var _ = Describe("Environment Controller", func() {
 			}
 			Expect(productionInfo).ToNot(BeNil())
 			Expect(productionInfo.History).ToNot(BeEmpty())
-			Expect(len(productionInfo.History)).To(Equal(1))
+			Expect(productionInfo.History).To(HaveLen(1))
 			Expect(productionInfo.History[0].Version.Revision).ToNot(BeNil())
 			Expect(*productionInfo.History[0].Version.Revision).To(Equal(productionRevision))
 
@@ -2599,7 +2596,7 @@ var _ = Describe("Environment Controller", func() {
 			}
 			Expect(stagingInfo).ToNot(BeNil(), "staging environment info should exist in production Environment status")
 			Expect(stagingInfo.History).ToNot(BeEmpty(), "staging history should not be empty")
-			Expect(len(stagingInfo.History)).To(Equal(1))
+			Expect(stagingInfo.History).To(HaveLen(1))
 			Expect(stagingInfo.History[0].Version.Revision).ToNot(BeNil())
 			Expect(*stagingInfo.History[0].Version.Revision).To(Equal(stagingRevision))
 			// Initially should have Deploying status (set in initial rollout status)
@@ -2631,7 +2628,7 @@ var _ = Describe("Environment Controller", func() {
 			}
 			Expect(stagingInfo).ToNot(BeNil())
 			Expect(stagingInfo.History).ToNot(BeEmpty())
-			Expect(len(stagingInfo.History)).To(Equal(1))
+			Expect(stagingInfo.History).To(HaveLen(1))
 			Expect(stagingInfo.History[0].BakeStatus).ToNot(BeNil())
 			Expect(*stagingInfo.History[0].BakeStatus).To(Equal(kuberikrolloutv1alpha1.BakeStatusSucceeded), "staging history should be updated to Succeeded status")
 			Expect(stagingInfo.History[0].BakeStatusMessage).ToNot(BeNil())
@@ -2657,7 +2654,7 @@ var _ = Describe("Environment Controller", func() {
 					},
 				},
 			}
-			k8sClient.Delete(context.Background(), stagingRollout)
+			_ = k8sClient.Delete(context.Background(), stagingRollout)
 			Expect(k8sClient.Create(context.Background(), stagingRollout)).Should(Succeed())
 
 			// Start with a deployment in Pending status
@@ -2693,7 +2690,7 @@ var _ = Describe("Environment Controller", func() {
 					Environment: "staging",
 				},
 			}
-			k8sClient.Delete(context.Background(), stagingEnv)
+			_ = k8sClient.Delete(context.Background(), stagingEnv)
 			Expect(k8sClient.Create(context.Background(), stagingEnv)).Should(Succeed())
 
 			By("Creating production Environment with relationship to staging")
@@ -2709,7 +2706,7 @@ var _ = Describe("Environment Controller", func() {
 					},
 				},
 			}
-			k8sClient.Delete(context.Background(), productionRollout)
+			_ = k8sClient.Delete(context.Background(), productionRollout)
 			Expect(k8sClient.Create(context.Background(), productionRollout)).Should(Succeed())
 
 			productionRollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -2747,7 +2744,7 @@ var _ = Describe("Environment Controller", func() {
 					},
 				},
 			}
-			k8sClient.Delete(context.Background(), productionEnv)
+			_ = k8sClient.Delete(context.Background(), productionEnv)
 			Expect(k8sClient.Create(context.Background(), productionEnv)).Should(Succeed())
 
 			By("Reconciling production Environment - should see Pending status")
@@ -2777,7 +2774,7 @@ var _ = Describe("Environment Controller", func() {
 				}
 			}
 			Expect(stagingInfo).ToNot(BeNil())
-			Expect(len(stagingInfo.History)).To(Equal(1))
+			Expect(stagingInfo.History).To(HaveLen(1))
 			Expect(stagingInfo.History[0].BakeStatus).ToNot(BeNil())
 			Expect(*stagingInfo.History[0].BakeStatus).To(Equal(kuberikrolloutv1alpha1.BakeStatusDeploying))
 
@@ -2810,7 +2807,7 @@ var _ = Describe("Environment Controller", func() {
 				}
 			}
 			Expect(stagingInfo).ToNot(BeNil())
-			Expect(len(stagingInfo.History)).To(Equal(1))
+			Expect(stagingInfo.History).To(HaveLen(1))
 			Expect(stagingInfo.History[0].BakeStatus).ToNot(BeNil())
 			Expect(*stagingInfo.History[0].BakeStatus).To(Equal(kuberikrolloutv1alpha1.BakeStatusInProgress), "staging history should be updated to InProgress")
 			Expect(stagingInfo.History[0].BakeStatusMessage).ToNot(BeNil())
@@ -2845,7 +2842,7 @@ var _ = Describe("Environment Controller", func() {
 				}
 			}
 			Expect(stagingInfo).ToNot(BeNil())
-			Expect(len(stagingInfo.History)).To(Equal(1))
+			Expect(stagingInfo.History).To(HaveLen(1))
 			Expect(stagingInfo.History[0].BakeStatus).ToNot(BeNil())
 			Expect(*stagingInfo.History[0].BakeStatus).To(Equal(kuberikrolloutv1alpha1.BakeStatusSucceeded), "staging history should be updated to Succeeded")
 			Expect(stagingInfo.History[0].BakeStatusMessage).ToNot(BeNil())
@@ -2933,7 +2930,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			rollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -2973,7 +2970,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			}
 			// Delete if exists first
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling Deployment")
@@ -3005,7 +3002,7 @@ var _ = Describe("Environment Controller", func() {
 			}
 			Expect(stagingInfo).ToNot(BeNil())
 			Expect(stagingInfo.History).ToNot(BeEmpty())
-			Expect(len(stagingInfo.History)).To(BeNumerically(">=", 1))
+			Expect(stagingInfo.History).ToNot(BeEmpty())
 
 			// Should NOT have status entries for qa (unrelated)
 			var qaInfo *kuberikv1alpha1.EnvironmentInfo
@@ -3016,7 +3013,7 @@ var _ = Describe("Environment Controller", func() {
 				}
 			}
 			if qaInfo != nil {
-				Expect(len(qaInfo.History)).To(Equal(0), "qa environment should not be tracked as it's not related")
+				Expect(qaInfo.History).To(BeEmpty(), "qa environment should not be tracked as it's not related")
 			}
 		})
 
@@ -3041,7 +3038,7 @@ var _ = Describe("Environment Controller", func() {
 					},
 				},
 			}
-			k8sClient.Delete(context.Background(), rollout)
+			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
 			rollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -3092,7 +3089,7 @@ var _ = Describe("Environment Controller", func() {
 					Environment: "production",
 				},
 			}
-			k8sClient.Delete(context.Background(), deployment)
+			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
 			By("Reconciling to create GitHub deployments")
@@ -3358,7 +3355,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			},
 		}
-		k8sClient.Delete(context.Background(), stagingRollout)
+		_ = k8sClient.Delete(context.Background(), stagingRollout)
 		Expect(k8sClient.Create(context.Background(), stagingRollout)).Should(Succeed())
 
 		stagingRollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -3396,7 +3393,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			},
 		}
-		k8sClient.Delete(context.Background(), stagingEnv)
+		_ = k8sClient.Delete(context.Background(), stagingEnv)
 		Expect(k8sClient.Create(context.Background(), stagingEnv)).Should(Succeed())
 
 		By("Creating dev environment and rollout")
@@ -3411,7 +3408,7 @@ var _ = Describe("Environment Controller", func() {
 				},
 			},
 		}
-		k8sClient.Delete(context.Background(), devRollout)
+		_ = k8sClient.Delete(context.Background(), devRollout)
 		Expect(k8sClient.Create(context.Background(), devRollout)).Should(Succeed())
 
 		devRollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
@@ -3445,7 +3442,7 @@ var _ = Describe("Environment Controller", func() {
 				Environment: "dev",
 			},
 		}
-		k8sClient.Delete(context.Background(), devEnv)
+		_ = k8sClient.Delete(context.Background(), devEnv)
 		Expect(k8sClient.Create(context.Background(), devEnv)).Should(Succeed())
 
 		By("First reconciliation - staging should be discovered and added")
@@ -3497,7 +3494,7 @@ var _ = Describe("Environment Controller", func() {
 			}
 		}
 		Expect(stagingInfo).ToNot(BeNil(), "staging should be preserved even if not discovered in current run due to pagination")
-		Expect(len(stagingInfo.History)).To(Equal(originalStagingHistoryCount), "staging history should be preserved")
+		Expect(stagingInfo.History).To(HaveLen(originalStagingHistoryCount), "staging history should be preserved")
 	})
 })
 

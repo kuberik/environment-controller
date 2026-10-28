@@ -65,7 +65,7 @@ var _ = BeforeSuite(func() {
 	}
 
 	if res, err := exec.Command("gh", "auth", "token").Output(); err == nil {
-		os.Setenv("GITHUB_TOKEN", strings.TrimSpace(string(res)))
+		Expect(os.Setenv("GITHUB_TOKEN", strings.TrimSpace(string(res)))).To(Succeed())
 	}
 
 	var err error

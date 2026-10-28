@@ -46,6 +46,36 @@ import (
 	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 )
 
+const (
+	// backendTypeGitHub is the Environment backend type handled by this controller
+	backendTypeGitHub = "github"
+	// productionEnvironment is the environment that is reported to GitHub as a production environment
+	productionEnvironment = "production"
+	// rolloutDashboardServiceName is the name of the rollout-dashboard service in the controller's namespace
+	rolloutDashboardServiceName = "rollout-dashboard"
+
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
+// GitHub deployment status states
+const (
+	githubStateSuccess    = "success"
+	githubStateFailure    = "failure"
+	githubStateInProgress = "in_progress"
+	githubStateInactive   = "inactive"
+	githubStatePending    = "pending"
+)
+
+// Bake status prefixes used in GitHub deployment status descriptions ("Status: message")
+const (
+	statusPrefixBakeSucceeded = "Bake succeeded"
+	statusPrefixBakeFailed    = "Bake failed"
+	statusPrefixBaking        = "Baking in progress"
+	statusPrefixBakeCancelled = "Bake cancelled"
+	statusPrefixDeploying     = "Deploying"
+)
+
 // deploymentPayload represents the payload stored in GitHub deployments
 // Only immutable data should be stored here since GitHub deployments cannot be updated
 type deploymentPayload struct {
@@ -81,65 +111,65 @@ type GitHubEnvironmentReconciler struct {
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := log.FromContext(ctx)
+	logger := log.FromContext(ctx)
 
 	// Fetch the Environment instance
 	deployment := &kuberikv1alpha1.Environment{}
 	err := r.Get(ctx, req.NamespacedName, deployment)
 	if err != nil {
 		if client.IgnoreNotFound(err) != nil {
-			log.Error(err, "Failed to get Environment")
+			logger.Error(err, "Failed to get Environment")
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	// Validate backend
-	if deployment.Spec.Backend.Type != "github" {
+	if deployment.Spec.Backend.Type != backendTypeGitHub {
 		return ctrl.Result{}, fmt.Errorf("unsupported backend: %s", deployment.Spec.Backend.Type)
 	}
 
 	// Get the referenced Rollout to get the current version
 	rollout, err := r.getReferencedRollout(ctx, deployment)
 	if err != nil {
-		log.Error(err, "Failed to get referenced Rollout")
+		logger.Error(err, "Failed to get referenced Rollout")
 		return ctrl.Result{}, err
 	}
 
 	// Get GitHub client
 	githubClient, err := r.getGitHubClient(ctx, deployment)
 	if err != nil {
-		log.Error(err, "Failed to get GitHub client")
+		logger.Error(err, "Failed to get GitHub client")
 		return ctrl.Result{}, err
 	}
 
 	// Sync entire rollout history with GitHub deployments and statuses
 	if err := r.syncDeploymentHistory(ctx, githubClient, deployment, rollout); err != nil {
-		log.Error(err, "Failed to sync deployment history")
+		logger.Error(err, "Failed to sync deployment history")
 		return ctrl.Result{}, err
 	}
 
 	// Build relationship graph
 	graphData, err := r.buildRelationshipGraph(ctx, deployment, githubClient)
 	if err != nil {
-		log.Error(err, "Failed to build relationship graph")
+		logger.Error(err, "Failed to build relationship graph")
 		return ctrl.Result{}, err
 	}
 
 	// Calculate and update Status
 	if err := r.updateStatus(ctx, deployment, graphData); err != nil {
-		log.Error(err, "Failed to update Environment status")
+		logger.Error(err, "Failed to update Environment status")
 		return ctrl.Result{}, err
 	}
 
 	// Create or update RolloutGate
 	if err := r.createOrUpdateRolloutGate(ctx, deployment); err != nil {
-		log.Error(err, "Failed to create or update RolloutGate")
+		logger.Error(err, "Failed to create or update RolloutGate")
 		return ctrl.Result{}, err
 	}
 
 	// Update allowed versions on RolloutGate based on relationships
 	if err := r.updateAllowedVersionsFromRelationships(ctx, deployment); err != nil {
-		log.Error(err, "Failed to update allowed versions from relationships")
+		logger.Error(err, "Failed to update allowed versions from relationships")
 		return ctrl.Result{}, err
 	}
 
@@ -148,7 +178,7 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if deployment.Spec.RequeueInterval != "" {
 		parsed, err := time.ParseDuration(deployment.Spec.RequeueInterval)
 		if err != nil {
-			log.Error(err, "Invalid RequeueInterval, using default", "interval", deployment.Spec.RequeueInterval)
+			logger.Error(err, "Invalid RequeueInterval, using default", "interval", deployment.Spec.RequeueInterval)
 		} else {
 			requeueInterval = parsed
 		}
@@ -250,7 +280,7 @@ func (r *GitHubEnvironmentReconciler) getGitHubClient(ctx context.Context, deplo
 }
 
 // createDeploymentStatus creates a GitHub deployment status for the given environment
-func (r *GitHubEnvironmentReconciler) createDeploymentStatus(ctx context.Context, client *github.Client, environment *kuberikv1alpha1.Environment, deploymentID int64, state string, description string) error {
+func (r *GitHubEnvironmentReconciler) createDeploymentStatus(ctx context.Context, ghClient *github.Client, environment *kuberikv1alpha1.Environment, deploymentID int64, state string, description string) error {
 	owner, repo, err := parseProject(environment.Spec.Backend.Project)
 	if err != nil {
 		return err
@@ -276,7 +306,7 @@ func (r *GitHubEnvironmentReconciler) createDeploymentStatus(ctx context.Context
 	}
 
 	// Create the deployment status
-	_, _, createErr := client.Repositories.CreateDeploymentStatus(ctx, owner, repo, deploymentID, statusRequest)
+	_, _, createErr := ghClient.Repositories.CreateDeploymentStatus(ctx, owner, repo, deploymentID, statusRequest)
 	if createErr != nil {
 		return fmt.Errorf("failed to create deployment status: %w", createErr)
 	}
@@ -320,11 +350,7 @@ func (r *GitHubEnvironmentReconciler) updateStatus(ctx context.Context, environm
 	newStatus.EnvironmentInfos = environmentInfoList
 
 	// Check if status changed
-	needsUpdate := false
-
-	if newStatus.CurrentVersion != environment.Status.CurrentVersion {
-		needsUpdate = true
-	}
+	needsUpdate := newStatus.CurrentVersion != environment.Status.CurrentVersion
 
 	if !environmentInfosEqual(newStatus.EnvironmentInfos, environment.Status.EnvironmentInfos) {
 		needsUpdate = true
@@ -518,7 +544,7 @@ func (r *GitHubEnvironmentReconciler) getRolloutDashboardURL(ctx context.Context
 	// First, check if rollout-dashboard service exists in controller's namespace
 	svc := &corev1.Service{}
 	err := r.Get(ctx, types.NamespacedName{
-		Name:      "rollout-dashboard",
+		Name:      rolloutDashboardServiceName,
 		Namespace: controllerNamespace,
 	}, svc)
 	if err != nil {
@@ -533,22 +559,46 @@ func (r *GitHubEnvironmentReconciler) getRolloutDashboardURL(ctx context.Context
 	}
 
 	// Find ingress that points to rollout-dashboard service
-	var baseURL string
-	for i := range ingressList.Items {
-		ingress := &ingressList.Items[i]
+	baseURL := dashboardBaseURLFromIngresses(ingressList.Items)
+
+	if baseURL == "" {
+		// Check Gateway API (HTTPRoute) if Ingress not found
+		httpRouteList := &gatewayv1.HTTPRouteList{}
+		if err := r.List(ctx, httpRouteList, client.InNamespace(controllerNamespace)); err != nil {
+			return ""
+		}
+
+		// Find HTTPRoute that points to rollout-dashboard service
+		baseURL = r.dashboardBaseURLFromHTTPRoutes(ctx, controllerNamespace, httpRouteList.Items)
+	}
+
+	if baseURL == "" {
+		return ""
+	}
+
+	// Append the path: /rollouts/<deploymentNamespace>/<deploymentName>
+	path := fmt.Sprintf("/rollouts/%s/%s", deploymentNamespace, deploymentName)
+	return fmt.Sprintf("%s%s", baseURL, path)
+}
+
+// dashboardBaseURLFromIngresses returns the base URL (scheme and host) of the first ingress
+// that routes to the rollout-dashboard service, or empty string if there is none.
+func dashboardBaseURLFromIngresses(ingresses []networkingv1.Ingress) string {
+	for i := range ingresses {
+		ingress := &ingresses[i]
+
+		scheme := schemeHTTPS
+		if len(ingress.Spec.TLS) == 0 {
+			scheme = schemeHTTP
+		}
 
 		// Check default backend first
 		if ingress.Spec.DefaultBackend != nil && ingress.Spec.DefaultBackend.Service != nil {
-			if ingress.Spec.DefaultBackend.Service.Name == "rollout-dashboard" {
+			if ingress.Spec.DefaultBackend.Service.Name == rolloutDashboardServiceName {
 				// For default backend, we need at least one rule with a host
 				// If no rules, we can't construct a URL
 				if len(ingress.Spec.Rules) > 0 && ingress.Spec.Rules[0].Host != "" {
-					scheme := "https"
-					if len(ingress.Spec.TLS) == 0 {
-						scheme = "http"
-					}
-					baseURL = fmt.Sprintf("%s://%s", scheme, ingress.Spec.Rules[0].Host)
-					break
+					return fmt.Sprintf("%s://%s", scheme, ingress.Spec.Rules[0].Host)
 				}
 			}
 		}
@@ -561,147 +611,134 @@ func (r *GitHubEnvironmentReconciler) getRolloutDashboardURL(ctx context.Context
 
 			// Check if any path in this rule points to rollout-dashboard service
 			for _, path := range rule.HTTP.Paths {
-				if path.Backend.Service != nil && path.Backend.Service.Name == "rollout-dashboard" {
-					// Construct base URL
-					scheme := "https"
-					if len(ingress.Spec.TLS) == 0 {
-						scheme = "http"
-					}
-					baseURL = fmt.Sprintf("%s://%s", scheme, rule.Host)
+				if path.Backend.Service != nil && path.Backend.Service.Name == rolloutDashboardServiceName {
 					// Note: We ignore the ingress path and use our own path instead
-					break
+					return fmt.Sprintf("%s://%s", scheme, rule.Host)
 				}
-			}
-			if baseURL != "" {
-				break
-			}
-		}
-		if baseURL != "" {
-			break
-		}
-	}
-
-	if baseURL == "" {
-		// Check Gateway API (HTTPRoute) if Ingress not found
-		httpRouteList := &gatewayv1.HTTPRouteList{}
-		if err := r.List(ctx, httpRouteList, client.InNamespace(controllerNamespace)); err != nil {
-			return ""
-		}
-
-		// Find HTTPRoute that points to rollout-dashboard service
-		for i := range httpRouteList.Items {
-			httpRoute := &httpRouteList.Items[i]
-
-			// Check if any rule references rollout-dashboard service
-			for _, rule := range httpRoute.Spec.Rules {
-				for _, backendRef := range rule.BackendRefs {
-					// Check if this backendRef points to rollout-dashboard service
-					// Default to Service kind if not specified
-					kind := gatewayv1.Kind("Service")
-					if backendRef.Kind != nil {
-						kind = *backendRef.Kind
-					}
-					if kind != gatewayv1.Kind("Service") {
-						continue
-					}
-
-					// Check namespace - default to HTTPRoute's namespace if not specified
-					backendNamespace := controllerNamespace
-					if backendRef.Namespace != nil {
-						backendNamespace = string(*backendRef.Namespace)
-					}
-
-					// Only check if backend is in the same namespace as the service
-					if backendNamespace == controllerNamespace && backendRef.Name == gatewayv1.ObjectName("rollout-dashboard") {
-						// Found HTTPRoute pointing to rollout-dashboard
-						// Get hostname from HTTPRoute spec, not from Gateway (which may have wildcards)
-						if len(httpRoute.Spec.Hostnames) == 0 {
-							continue
-						}
-						hostname := string(httpRoute.Spec.Hostnames[0])
-
-						// Get the Gateway to determine protocol (HTTP vs HTTPS)
-						if len(httpRoute.Spec.ParentRefs) == 0 {
-							continue
-						}
-
-						parentRef := httpRoute.Spec.ParentRefs[0]
-						gatewayName := string(parentRef.Name)
-						gatewayNamespace := controllerNamespace
-						if parentRef.Namespace != nil {
-							gatewayNamespace = string(*parentRef.Namespace)
-						}
-
-						gateway := &gatewayv1.Gateway{}
-						if err := r.Get(ctx, types.NamespacedName{
-							Name:      gatewayName,
-							Namespace: gatewayNamespace,
-						}, gateway); err != nil {
-							continue
-						}
-
-						// Find the listener to determine protocol
-						// If parentRef specifies a SectionName, use that specific listener
-						// Otherwise, match listener by hostname
-						var targetListener *gatewayv1.Listener
-						if parentRef.SectionName != nil {
-							// Match by listener name
-							listenerName := string(*parentRef.SectionName)
-							for i := range gateway.Spec.Listeners {
-								if string(gateway.Spec.Listeners[i].Name) == listenerName {
-									targetListener = &gateway.Spec.Listeners[i]
-									break
-								}
-							}
-						} else {
-							// Match listener by hostname
-							for i := range gateway.Spec.Listeners {
-								if gateway.Spec.Listeners[i].Hostname != nil {
-									// Check if listener hostname matches or is a wildcard that covers our hostname
-									listenerHostname := string(*gateway.Spec.Listeners[i].Hostname)
-									if listenerHostname == hostname || listenerHostname == "*" ||
-										(strings.HasPrefix(listenerHostname, "*.") && strings.HasSuffix(hostname, "."+listenerHostname[2:])) {
-										targetListener = &gateway.Spec.Listeners[i]
-										break
-									}
-								}
-							}
-							// If no match found, use first listener as fallback
-							if targetListener == nil && len(gateway.Spec.Listeners) > 0 {
-								targetListener = &gateway.Spec.Listeners[0]
-							}
-						}
-
-						if targetListener != nil {
-							scheme := "https"
-							if targetListener.Protocol == gatewayv1.HTTPProtocolType {
-								scheme = "http"
-							}
-							baseURL = fmt.Sprintf("%s://%s", scheme, hostname)
-						}
-
-						if baseURL != "" {
-							break
-						}
-					}
-				}
-				if baseURL != "" {
-					break
-				}
-			}
-			if baseURL != "" {
-				break
 			}
 		}
 	}
+	return ""
+}
 
-	if baseURL == "" {
+// dashboardBaseURLFromHTTPRoutes returns the base URL (scheme and host) of the first HTTPRoute
+// that routes to the rollout-dashboard service, or empty string if there is none.
+func (r *GitHubEnvironmentReconciler) dashboardBaseURLFromHTTPRoutes(ctx context.Context, controllerNamespace string, httpRoutes []gatewayv1.HTTPRoute) string {
+	for i := range httpRoutes {
+		httpRoute := &httpRoutes[i]
+
+		// Check if any rule references rollout-dashboard service
+		for _, rule := range httpRoute.Spec.Rules {
+			for _, backendRef := range rule.BackendRefs {
+				if !isDashboardBackendRef(backendRef.BackendObjectReference, controllerNamespace) {
+					continue
+				}
+
+				// Found HTTPRoute pointing to rollout-dashboard
+				if baseURL := r.httpRouteBaseURL(ctx, controllerNamespace, httpRoute); baseURL != "" {
+					return baseURL
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// isDashboardBackendRef reports whether backendRef points to the rollout-dashboard service
+// in the controller's namespace.
+func isDashboardBackendRef(backendRef gatewayv1.BackendObjectReference, controllerNamespace string) bool {
+	// Default to Service kind if not specified
+	kind := gatewayv1.Kind("Service")
+	if backendRef.Kind != nil {
+		kind = *backendRef.Kind
+	}
+	if kind != gatewayv1.Kind("Service") {
+		return false
+	}
+
+	// Check namespace - default to HTTPRoute's namespace if not specified
+	backendNamespace := controllerNamespace
+	if backendRef.Namespace != nil {
+		backendNamespace = string(*backendRef.Namespace)
+	}
+
+	// Only check if backend is in the same namespace as the service
+	return backendNamespace == controllerNamespace && backendRef.Name == gatewayv1.ObjectName(rolloutDashboardServiceName)
+}
+
+// httpRouteBaseURL returns the base URL (scheme and host) for an HTTPRoute, using its first
+// hostname and the protocol of the Gateway listener it is attached to. Returns empty string
+// if either cannot be determined.
+func (r *GitHubEnvironmentReconciler) httpRouteBaseURL(ctx context.Context, controllerNamespace string, httpRoute *gatewayv1.HTTPRoute) string {
+	// Get hostname from HTTPRoute spec, not from Gateway (which may have wildcards)
+	if len(httpRoute.Spec.Hostnames) == 0 {
+		return ""
+	}
+	hostname := string(httpRoute.Spec.Hostnames[0])
+
+	// Get the Gateway to determine protocol (HTTP vs HTTPS)
+	if len(httpRoute.Spec.ParentRefs) == 0 {
 		return ""
 	}
 
-	// Append the path: /rollouts/<deploymentNamespace>/<deploymentName>
-	path := fmt.Sprintf("/rollouts/%s/%s", deploymentNamespace, deploymentName)
-	return fmt.Sprintf("%s%s", baseURL, path)
+	parentRef := httpRoute.Spec.ParentRefs[0]
+	gatewayName := string(parentRef.Name)
+	gatewayNamespace := controllerNamespace
+	if parentRef.Namespace != nil {
+		gatewayNamespace = string(*parentRef.Namespace)
+	}
+
+	gateway := &gatewayv1.Gateway{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      gatewayName,
+		Namespace: gatewayNamespace,
+	}, gateway); err != nil {
+		return ""
+	}
+
+	targetListener := findGatewayListener(gateway, parentRef.SectionName, hostname)
+	if targetListener == nil {
+		return ""
+	}
+
+	scheme := schemeHTTPS
+	if targetListener.Protocol == gatewayv1.HTTPProtocolType {
+		scheme = schemeHTTP
+	}
+	return fmt.Sprintf("%s://%s", scheme, hostname)
+}
+
+// findGatewayListener finds the Gateway listener that serves hostname.
+// If sectionName is set, the listener with that name is used.
+// Otherwise the listener is matched by hostname, falling back to the first listener.
+func findGatewayListener(gateway *gatewayv1.Gateway, sectionName *gatewayv1.SectionName, hostname string) *gatewayv1.Listener {
+	if sectionName != nil {
+		// Match by listener name
+		listenerName := string(*sectionName)
+		for i := range gateway.Spec.Listeners {
+			if string(gateway.Spec.Listeners[i].Name) == listenerName {
+				return &gateway.Spec.Listeners[i]
+			}
+		}
+		return nil
+	}
+
+	// Match listener by hostname
+	for i := range gateway.Spec.Listeners {
+		if gateway.Spec.Listeners[i].Hostname != nil {
+			// Check if listener hostname matches or is a wildcard that covers our hostname
+			listenerHostname := string(*gateway.Spec.Listeners[i].Hostname)
+			if listenerHostname == hostname || listenerHostname == "*" ||
+				(strings.HasPrefix(listenerHostname, "*.") && strings.HasSuffix(hostname, "."+listenerHostname[2:])) {
+				return &gateway.Spec.Listeners[i]
+			}
+		}
+	}
+	// If no match found, use first listener as fallback
+	if len(gateway.Spec.Listeners) > 0 {
+		return &gateway.Spec.Listeners[0]
+	}
+	return nil
 }
 
 // extractDeploymentPayload extracts the deployment payload from a GitHub deployment
@@ -885,7 +922,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 				Task:                  &task,
 				Environment:           &formattedEnv,
 				Description:           h.Message,
-				ProductionEnvironment: github.Bool(environment.Spec.Environment == "production"),
+				ProductionEnvironment: github.Bool(environment.Spec.Environment == productionEnvironment),
 				AutoMerge:             github.Bool(false),
 				Payload:               payloadJSON,
 				RequiredContexts:      k8sptr.To([]string{}),
@@ -951,23 +988,23 @@ func mapBakeToGitHubState(bakeStatus *string) (string, string) {
 	var statusPrefix string
 	switch status {
 	case kuberikrolloutv1alpha1.BakeStatusSucceeded:
-		ghState = "success"
-		statusPrefix = "Bake succeeded"
+		ghState = githubStateSuccess
+		statusPrefix = statusPrefixBakeSucceeded
 	case kuberikrolloutv1alpha1.BakeStatusFailed:
-		ghState = "failure"
-		statusPrefix = "Bake failed"
+		ghState = githubStateFailure
+		statusPrefix = statusPrefixBakeFailed
 	case kuberikrolloutv1alpha1.BakeStatusInProgress:
-		ghState = "in_progress"
-		statusPrefix = "Baking in progress"
+		ghState = githubStateInProgress
+		statusPrefix = statusPrefixBaking
 	case kuberikrolloutv1alpha1.BakeStatusDeploying:
-		ghState = "in_progress"
-		statusPrefix = "Deploying"
+		ghState = githubStateInProgress
+		statusPrefix = statusPrefixDeploying
 	case kuberikrolloutv1alpha1.BakeStatusCancelled:
-		ghState = "inactive"
-		statusPrefix = "Bake cancelled"
+		ghState = githubStateInactive
+		statusPrefix = statusPrefixBakeCancelled
 	default:
-		ghState = "pending"
-		statusPrefix = "Deploying"
+		ghState = githubStatePending
+		statusPrefix = statusPrefixDeploying
 	}
 
 	return ghState, statusPrefix
@@ -991,19 +1028,19 @@ func extractBakeStatusFromDescription(description string) (*string, *string) {
 
 	// Determine bake status from the status prefix
 	switch statusPrefix {
-	case "Bake succeeded":
+	case statusPrefixBakeSucceeded:
 		status := kuberikrolloutv1alpha1.BakeStatusSucceeded
 		bakeStatus = &status
-	case "Bake failed":
+	case statusPrefixBakeFailed:
 		status := kuberikrolloutv1alpha1.BakeStatusFailed
 		bakeStatus = &status
-	case "Baking in progress":
+	case statusPrefixBaking:
 		status := kuberikrolloutv1alpha1.BakeStatusInProgress
 		bakeStatus = &status
-	case "Bake cancelled":
+	case statusPrefixBakeCancelled:
 		status := kuberikrolloutv1alpha1.BakeStatusCancelled
 		bakeStatus = &status
-	case "Deploying":
+	case statusPrefixDeploying:
 		status := kuberikrolloutv1alpha1.BakeStatusDeploying
 		bakeStatus = &status
 	default:
@@ -1044,9 +1081,9 @@ func applyGitHubStatusToEntry(entry *kuberikrolloutv1alpha1.DeploymentHistoryEnt
 		}
 		// Skip inactive statuses that don't appear to be from our controller
 		// These are often set automatically by GitHub and don't contain our bake status information
-		if status.State != nil && *status.State == "inactive" {
+		if status.State != nil && *status.State == githubStateInactive {
 			// Only consider inactive statuses that have our status prefix
-			if !strings.HasPrefix(*status.Description, "Bake cancelled") {
+			if !strings.HasPrefix(*status.Description, statusPrefixBakeCancelled) {
 				continue
 			}
 		}
@@ -1219,24 +1256,7 @@ func (r *GitHubEnvironmentReconciler) createOrUpdateRolloutGate(ctx context.Cont
 	}
 
 	// Find existing RolloutGate owned by this Environment
-	var existingRolloutGate *kuberikrolloutv1alpha1.RolloutGate
-	for i := range rolloutGateList.Items {
-		gate := &rolloutGateList.Items[i]
-		for _, ownerRef := range gate.OwnerReferences {
-			if ownerRef.Kind == "Environment" &&
-				ownerRef.APIVersion == kuberikv1alpha1.GroupVersion.String() &&
-				ownerRef.Name == environment.Name {
-				// If UID is set, it must match; otherwise match by name and kind only
-				if ownerRef.UID == "" || ownerRef.UID == environment.UID {
-					existingRolloutGate = gate
-					break
-				}
-			}
-		}
-		if existingRolloutGate != nil {
-			break
-		}
-	}
+	existingRolloutGate := findOwnedRolloutGate(rolloutGateList.Items, environment)
 
 	if existingRolloutGate == nil {
 		// RolloutGate doesn't exist, create it
@@ -1332,6 +1352,24 @@ func (r *GitHubEnvironmentReconciler) createOrUpdateRolloutGate(ctx context.Cont
 	return nil
 }
 
+// findOwnedRolloutGate returns the RolloutGate owned by the given Environment, or nil if there is none
+func findOwnedRolloutGate(gates []kuberikrolloutv1alpha1.RolloutGate, environment *kuberikv1alpha1.Environment) *kuberikrolloutv1alpha1.RolloutGate {
+	for i := range gates {
+		gate := &gates[i]
+		for _, ownerRef := range gate.OwnerReferences {
+			if ownerRef.Kind == "Environment" &&
+				ownerRef.APIVersion == kuberikv1alpha1.GroupVersion.String() &&
+				ownerRef.Name == environment.Name {
+				// If UID is set, it must match; otherwise match by name and kind only
+				if ownerRef.UID == "" || ownerRef.UID == environment.UID {
+					return gate
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // environmentInfo holds information about an environment's deployment
 type environmentInfo struct {
 	EnvironmentURL string
@@ -1351,6 +1389,8 @@ type relationshipGraphData struct {
 }
 
 // buildRelationshipGraph discovers all environments and builds the relationship graph
+//
+//nolint:gocyclo // Core relationship logic, deliberately left unchanged by the lint cleanup; split it up in its own change.
 func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context, environment *kuberikv1alpha1.Environment, ghClient *github.Client) (*relationshipGraphData, error) {
 	owner, repo, err := parseProject(environment.Spec.Backend.Project)
 	if err != nil {
@@ -1860,32 +1900,8 @@ func historyEntriesEqual(a, b []kuberikrolloutv1alpha1.DeploymentHistoryEntry) b
 	}
 
 	// Create maps for easier comparison: key is ID (or revision if ID is not available)
-	aMap := make(map[string]kuberikrolloutv1alpha1.DeploymentHistoryEntry)
-	bMap := make(map[string]kuberikrolloutv1alpha1.DeploymentHistoryEntry)
-
-	for _, entry := range a {
-		key := ""
-		if entry.ID != nil {
-			key = fmt.Sprintf("id:%d", *entry.ID)
-		} else if entry.Version.Revision != nil {
-			key = fmt.Sprintf("rev:%s", *entry.Version.Revision)
-		}
-		if key != "" {
-			aMap[key] = entry
-		}
-	}
-
-	for _, entry := range b {
-		key := ""
-		if entry.ID != nil {
-			key = fmt.Sprintf("id:%d", *entry.ID)
-		} else if entry.Version.Revision != nil {
-			key = fmt.Sprintf("rev:%s", *entry.Version.Revision)
-		}
-		if key != "" {
-			bMap[key] = entry
-		}
-	}
+	aMap := historyEntriesByKey(a)
+	bMap := historyEntriesByKey(b)
 
 	if len(aMap) != len(bMap) {
 		return false
@@ -1897,44 +1913,69 @@ func historyEntriesEqual(a, b []kuberikrolloutv1alpha1.DeploymentHistoryEntry) b
 		if !exists {
 			return false
 		}
-		// Compare all relevant fields that can change
-		// ID comparison
-		if (aEntry.ID == nil) != (bEntry.ID == nil) {
-			return false
-		}
-		if aEntry.ID != nil && bEntry.ID != nil && *aEntry.ID != *bEntry.ID {
-			return false
-		}
-		// Bake status comparison
-		if (aEntry.BakeStatus == nil) != (bEntry.BakeStatus == nil) {
-			return false
-		}
-		if aEntry.BakeStatus != nil && bEntry.BakeStatus != nil && *aEntry.BakeStatus != *bEntry.BakeStatus {
-			return false
-		}
-		// Bake status message comparison
-		if (aEntry.BakeStatusMessage == nil) != (bEntry.BakeStatusMessage == nil) {
-			return false
-		}
-		if aEntry.BakeStatusMessage != nil && bEntry.BakeStatusMessage != nil && *aEntry.BakeStatusMessage != *bEntry.BakeStatusMessage {
-			return false
-		}
-		// Bake start time comparison
-		if (aEntry.BakeStartTime == nil) != (bEntry.BakeStartTime == nil) {
-			return false
-		}
-		if aEntry.BakeStartTime != nil && bEntry.BakeStartTime != nil && !aEntry.BakeStartTime.Equal(bEntry.BakeStartTime) {
-			return false
-		}
-		// Bake end time comparison
-		if (aEntry.BakeEndTime == nil) != (bEntry.BakeEndTime == nil) {
-			return false
-		}
-		if aEntry.BakeEndTime != nil && bEntry.BakeEndTime != nil && !aEntry.BakeEndTime.Equal(bEntry.BakeEndTime) {
+		if !historyEntryFieldsEqual(&aEntry, &bEntry) {
 			return false
 		}
 	}
 
+	return true
+}
+
+// historyEntriesByKey maps history entries by ID, or by revision if the ID is not available.
+// Entries with neither are left out.
+func historyEntriesByKey(entries []kuberikrolloutv1alpha1.DeploymentHistoryEntry) map[string]kuberikrolloutv1alpha1.DeploymentHistoryEntry {
+	byKey := make(map[string]kuberikrolloutv1alpha1.DeploymentHistoryEntry)
+	for _, entry := range entries {
+		key := ""
+		if entry.ID != nil {
+			key = fmt.Sprintf("id:%d", *entry.ID)
+		} else if entry.Version.Revision != nil {
+			key = fmt.Sprintf("rev:%s", *entry.Version.Revision)
+		}
+		if key != "" {
+			byKey[key] = entry
+		}
+	}
+	return byKey
+}
+
+// historyEntryFieldsEqual compares all relevant fields of two history entries that can change
+func historyEntryFieldsEqual(aEntry, bEntry *kuberikrolloutv1alpha1.DeploymentHistoryEntry) bool {
+	// ID comparison
+	if (aEntry.ID == nil) != (bEntry.ID == nil) {
+		return false
+	}
+	if aEntry.ID != nil && bEntry.ID != nil && *aEntry.ID != *bEntry.ID {
+		return false
+	}
+	// Bake status comparison
+	if (aEntry.BakeStatus == nil) != (bEntry.BakeStatus == nil) {
+		return false
+	}
+	if aEntry.BakeStatus != nil && bEntry.BakeStatus != nil && *aEntry.BakeStatus != *bEntry.BakeStatus {
+		return false
+	}
+	// Bake status message comparison
+	if (aEntry.BakeStatusMessage == nil) != (bEntry.BakeStatusMessage == nil) {
+		return false
+	}
+	if aEntry.BakeStatusMessage != nil && bEntry.BakeStatusMessage != nil && *aEntry.BakeStatusMessage != *bEntry.BakeStatusMessage {
+		return false
+	}
+	// Bake start time comparison
+	if (aEntry.BakeStartTime == nil) != (bEntry.BakeStartTime == nil) {
+		return false
+	}
+	if aEntry.BakeStartTime != nil && bEntry.BakeStartTime != nil && !aEntry.BakeStartTime.Equal(bEntry.BakeStartTime) {
+		return false
+	}
+	// Bake end time comparison
+	if (aEntry.BakeEndTime == nil) != (bEntry.BakeEndTime == nil) {
+		return false
+	}
+	if aEntry.BakeEndTime != nil && bEntry.BakeEndTime != nil && !aEntry.BakeEndTime.Equal(bEntry.BakeEndTime) {
+		return false
+	}
 	return true
 }
 

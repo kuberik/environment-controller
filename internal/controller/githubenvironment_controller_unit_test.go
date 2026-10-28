@@ -246,12 +246,12 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 			// Verify: each environment keeps ALL its own history (not filtered by relevantVersions)
 			// This is the key point - environmentInfos contain full history for each environment
 			devHistory := envHistory["dev"]
-			Expect(len(devHistory)).To(Equal(2))
+			Expect(devHistory).To(HaveLen(2))
 			Expect(*devHistory[0].Version.Revision).To(Equal(revision1))
 			Expect(*devHistory[1].Version.Revision).To(Equal(revision2))
 
 			stagingHistory := envHistory["staging"]
-			Expect(len(stagingHistory)).To(Equal(2))
+			Expect(stagingHistory).To(HaveLen(2))
 			Expect(*stagingHistory[0].Version.Revision).To(Equal(revision2))
 			Expect(*stagingHistory[1].Version.Revision).To(Equal(revision3))
 		})
@@ -292,7 +292,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 
 			// Should only include entries with valid revisions
 			Expect(relevantVersions).To(HaveKey("rev1"))
-			Expect(len(relevantVersions)).To(Equal(1))
+			Expect(relevantVersions).To(HaveLen(1))
 		})
 	})
 
@@ -396,7 +396,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 					Expect(info.EnvironmentURL).To(Equal("https://staging.example.com"))
 					Expect(info.Relationship).ToNot(BeNil())
 					Expect(info.Relationship.Environment).To(Equal("dev"))
-					Expect(len(info.History)).To(Equal(1))
+					Expect(info.History).To(HaveLen(1))
 					Expect(*info.History[0].Version.Revision).To(Equal("staging-rev-25"))
 					break
 				}
@@ -467,7 +467,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			// dev -> staging -> prod
-			Expect(len(environment.Status.EnvironmentInfos)).To(Equal(3))
+			Expect(environment.Status.EnvironmentInfos).To(HaveLen(3))
 			Expect(environment.Status.EnvironmentInfos[0].Environment).To(Equal("dev"))
 			Expect(environment.Status.EnvironmentInfos[1].Environment).To(Equal("staging"))
 			Expect(environment.Status.EnvironmentInfos[2].Environment).To(Equal("prod"))
@@ -482,7 +482,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 			}
 
 			result := updateEnvironmentInfoWithHistory(infos, "dev", "url", nil, history)
-			Expect(len(result)).To(Equal(1))
+			Expect(result).To(HaveLen(1))
 			Expect(result[0].History[0].ID).To(Equal(k8sptr.To(int64(30))))
 			Expect(result[0].History[1].ID).To(Equal(k8sptr.To(int64(20))))
 			Expect(result[0].History[2].ID).To(Equal(k8sptr.To(int64(10))))
@@ -573,8 +573,8 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 
 			infos := updateEnvironmentInfoWithHistory(nil, "dev", "https://dev.com", nil, history)
 
-			Expect(len(infos)).To(Equal(1))
-			Expect(len(infos[0].History)).To(Equal(3))
+			Expect(infos).To(HaveLen(1))
+			Expect(infos[0].History).To(HaveLen(3))
 			Expect(*infos[0].History[0].ID).To(Equal(int64(30)))
 			Expect(*infos[0].History[1].ID).To(Equal(int64(20)))
 			Expect(*infos[0].History[2].ID).To(Equal(int64(10)))
@@ -597,9 +597,9 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 
 			infos = updateEnvironmentInfoWithHistory(infos, "dev", "https://dev-updated.com", nil, newHistory)
 
-			Expect(len(infos)).To(Equal(1))
+			Expect(infos).To(HaveLen(1))
 			Expect(infos[0].EnvironmentURL).To(Equal("https://dev-updated.com"))
-			Expect(len(infos[0].History)).To(Equal(2))
+			Expect(infos[0].History).To(HaveLen(2))
 			Expect(*infos[0].History[0].ID).To(Equal(int64(15)))
 			Expect(*infos[0].History[1].ID).To(Equal(int64(5)))
 		})
@@ -635,7 +635,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 			err = reconciler.updateStatus(context.Background(), environment, graphData)
 			Expect(err).ToNot(HaveOccurred())
 
-			Expect(len(environment.Status.EnvironmentInfos)).To(Equal(3))
+			Expect(environment.Status.EnvironmentInfos).To(HaveLen(3))
 			Expect(environment.Status.EnvironmentInfos[0].Environment).To(Equal("dev"))
 			Expect(environment.Status.EnvironmentInfos[1].Environment).To(Equal("prod"))
 			Expect(environment.Status.EnvironmentInfos[2].Environment).To(Equal("staging"))

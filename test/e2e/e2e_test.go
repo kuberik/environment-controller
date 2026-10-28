@@ -34,13 +34,13 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "environment-controller-system"
+const namespace = "kuberik-system"
 
 // serviceAccountName created for the project
-const serviceAccountName = "environment-controller-controller-manager"
+const serviceAccountName = "environment-controller-manager"
 
 // metricsServiceName is the name of the metrics service of the project
-const metricsServiceName = "environment-controller-controller-manager-metrics-service"
+const metricsServiceName = "environment-controller-manager-metrics-service"
 
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "environment-controller-metrics-binding"
@@ -176,7 +176,7 @@ var _ = Describe("Manager", Ordered, func() {
 		It("should ensure the metrics endpoint is serving metrics", func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
 			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=environment-controller-metrics-reader",
+				"--clusterrole=environment-metrics-reader",
 				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
 			)
 			_, err := utils.Run(cmd)

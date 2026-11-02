@@ -188,7 +188,7 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	// Site changes and removal (deregister the old site, drop wave status)
 	if err := r.reconcileSiteChange(ctx, githubClient, deployment); err != nil {
-		log.Error(err, "Failed to reconcile site change")
+		logger.Error(err, "Failed to reconcile site change")
 		return ctrl.Result{}, err
 	}
 

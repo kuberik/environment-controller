@@ -52,6 +52,10 @@ import (
 const (
 	// backendTypeGitHub is the Environment backend type handled by this controller
 	backendTypeGitHub = "github"
+
+
+	// defaultSecretName is the GitHub token Secret used when Backend.Secret is unset.
+	defaultSecretName = "github-token"
 	// productionEnvironment is the environment that is reported to GitHub as a production environment
 	productionEnvironment = "production"
 	// rolloutDashboardServiceName is the name of the rollout-dashboard service in the controller's namespace
@@ -304,7 +308,7 @@ func (r *GitHubEnvironmentReconciler) getReferencedRollout(ctx context.Context, 
 func (r *GitHubEnvironmentReconciler) getGitHubClient(ctx context.Context, deployment *kuberikv1alpha1.Environment) (*github.Client, error) {
 	secretName := deployment.Spec.Backend.Secret
 	if secretName == "" {
-		secretName = "github-token" // Default secret name
+		secretName = defaultSecretName
 	}
 
 	secret := &corev1.Secret{}
@@ -346,12 +350,6 @@ func (r *GitHubEnvironmentReconciler) getGitHubClient(ctx context.Context, deplo
 
 // createDeploymentStatus creates a GitHub deployment status for the given environment
 func (r *GitHubEnvironmentReconciler) createDeploymentStatus(ctx context.Context, ghClient *github.Client, environment *kuberikv1alpha1.Environment, deploymentID int64, state string, description string) error {
-	return r.createDeploymentStatusWithURL(ctx, ghClient, environment, deploymentID, state, description, true)
-}
-
-// createDeploymentStatusWithURL is createDeploymentStatus with control over the
-// environment_url lookup (the deregistration marker does not need it).
-func (r *GitHubEnvironmentReconciler) createDeploymentStatusWithURL(ctx context.Context, ghClient *github.Client, environment *kuberikv1alpha1.Environment, deploymentID int64, state string, description string, withURL bool) error {
 	owner, repo, err := parseProject(environment.Spec.Backend.Project)
 	if err != nil {
 		return err

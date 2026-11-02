@@ -698,7 +698,7 @@ func (r *GitHubEnvironmentReconciler) reconcileDelete(ctx context.Context, env *
 		id = rec // what was actually written to GitHub
 	}
 	site := id.site
-	if site == "" || env.Spec.Backend.Type != "github" {
+	if site == "" || env.Spec.Backend.Type != backendTypeGitHub {
 		return ctrl.Result{}, r.removeFinalizer(ctx, env)
 	}
 	gh, err := r.getGitHubClient(ctx, env)

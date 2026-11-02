@@ -3,6 +3,10 @@
 # goes to its OWN cluster (apply each document only there); they are shown
 # together for reading. Sites are told
 # apart in GitHub by payload metadata, the GitHub environment name is the same.
+# Each (name, environment, site) may be owned by only one Environment across
+# all clusters; a second one reports WaveReady=False / DuplicateSite.
+# Environment order is fixed (dev < test < staging < prod): prod is gated on the
+# last wave of staging when staging exists in GitHub for the same name.
 #
 # Wave 1: eu-west-1 and us-east-1 (the lexicographically lowest, eu-west-1, leads).
 # Wave 2: ap-south-1 starts a version only after BOTH wave-1 sites baked it.
@@ -18,9 +22,6 @@ spec:
   environment: prod
   site: eu-west-1
   wave: 1
-  relationship:
-    type: After
-    environment: staging
   backend:
     type: github
     project: myorg/myapp
@@ -38,9 +39,6 @@ spec:
   environment: prod
   site: us-east-1
   wave: 1
-  relationship:
-    type: After
-    environment: staging
   backend:
     type: github
     project: myorg/myapp
@@ -58,9 +56,6 @@ spec:
   environment: prod
   site: ap-south-1
   wave: 2
-  relationship:
-    type: After
-    environment: staging
   backend:
     type: github
     project: myorg/myapp

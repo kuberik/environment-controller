@@ -23,13 +23,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Environment Controller?
 
-A Kubernetes controller for managing environments and their relationships across different backends. Currently implements GitHub backend integration that reports deployment status to GitHub's Deployments API and manages environment relationships.
+A Kubernetes controller that orders environments by fixed tiers and rolls each one out across sites and waves, across different backends. Currently implements GitHub backend integration that reports deployment status to GitHub's Deployments API and derives rollout gates from it.
 
 ## Key Features
 
 - **Multi-Backend Support**: Generic Environment API that can support multiple backends (currently GitHub)
 - **GitHub Deployment Integration**: Creates and manages GitHub deployments for Environment resources
-- **Relationship Management**: Manages environment relationships (After, Alongside)
+- **Tier Ordering**: Fixed tier order dev < test < staging < prod (`spec.relationship` is deprecated and ignored)
+- **Sites and Waves**: One environment across several clusters (sites), ordered waves, one owner per site
 - **Status Reporting**: Reports deployment status back to GitHub Deployments API
 - **Automatic RolloutGate Creation**: Automatically creates and manages RolloutGate resources
 
@@ -85,13 +86,8 @@ spec:
 
   # Environment configuration
   name: "kuberik-myapp-production"
-  environment: "production"
+  environment: "prod"   # dev|development|test|qa|staging|stage|preprod|prod|production
   ref: "main"
-
-  # Relationship configuration
-  relationship:
-    type: "After"
-    environment: "staging"
 
   # Backend-specific configuration
   backend:
@@ -99,9 +95,9 @@ spec:
     project: "myorg/myapp"
     secret: "github-token"
 
-  # Optional sites and waves (see README "Sites and waves"). Omit for site-less.
-  # site: eu-west-1   # defaults to the controller's --default-site / $SITE
-  # wave: 1           # defaults to 1 when a site is set
+  # Optional sites and waves (see README "Sites and waves").
+  # site: eu-west-1   # defaults to --default-site / $SITE, then "default"
+  # wave: 1           # defaults to 1
   # lockstep: false
 ```
 
@@ -136,15 +132,16 @@ data:
 5. **GitHub Deployment Sync**: Syncs entire rollout history with GitHub deployments and statuses
 6. **Status Reporting**: Reports deployment status to GitHub's Deployments API
 7. **RolloutGate Management**: Automatically creates and manages RolloutGate resources
-8. **Relationship Resolution**: Checks deployment statuses across environments to determine allowed versions
+8. **Tier and Wave Resolution**: Reads deployments and statuses from GitHub to determine the upstream tier, wave and allowed versions
 
-## Environment Relationships
+## Tiers, Sites and Waves
 
-**Relationship Types:**
-- `After`: Sequential deployment (a version passes once the other environment's deployment of it succeeded)
-- `Alongside`: Follow the other environment (a version passes as soon as the other environment starts deploying it, unless that deployment failed or was cancelled)
-
-When relationships are specified, the controller automatically creates RolloutGate resources to enforce the deployment order.
+- **Tiers**: `spec.environment` is an enum (`dev`, `development`, `test`, `qa`, `staging`, `stage`, `preprod`, `prod`, `production`); canonical order dev < test < staging < prod, aliases are the same tier everywhere (`internal/wave/tier.go`). Upstream = last wave of the nearest earlier tier present in GitHub for the same deployment name.
+- **Defaults**: site = `spec.site`, else `--default-site` / `$SITE` (ConfigMap `kuberik-cluster-info` key `site`), else `default`; wave = `spec.wave`, else 1. Every Environment is sited and carries the `environments.kuberik.com/deregister` finalizer. Legacy GitHub deployments without a site count as site `default`, wave 1 (normalised in `extractDeploymentPayload`); a cluster whose default site is not `default` does not continue that history.
+- **Ownership** (`internal/controller/ownership.go`): one owner `{cluster (kube-system UID), namespace, name}` per deployment name + tier + site across clusters, recorded as payload `owner`. First registration wins; a duplicate posts nothing, gets gate `[]` and `WaveReady=False/DuplicateSite`; deleting it does not touch the owner; deregistration frees the slot; ownerless (legacy) deployments are adopted.
+- **Followers** drop the leader's version when the leader's bake Failed/Cancelled; followers that have not started get an empty gate.
+- **Deprecated**: `spec.relationship` is accepted and ignored (`Deprecated=True/RelationshipIgnored`), removed in a later release. Do not reintroduce After/Alongside logic.
+- **Deleting an Environment** garbage-collects its RolloutGate (ownerRef), leaving the Rollout ungated: pin it (`spec.wantedVersion`) or delete the Rollout first.
 
 ## API Reference
 
@@ -154,9 +151,12 @@ When relationships are specified, the controller automatically creates RolloutGa
 type EnvironmentSpec struct {
     RolloutRef       corev1.LocalObjectReference `json:"rolloutRef"`
     Name             string                      `json:"name"`
-    Environment      string                      `json:"environment,omitempty"`
+    Environment      string                      `json:"environment"`
     Ref              string                      `json:"ref,omitempty"`
-    Relationship     *EnvironmentRelationship    `json:"relationship,omitempty"`
+    Relationship     *EnvironmentRelationship    `json:"relationship,omitempty"` // deprecated, ignored
+    Site             string                      `json:"site,omitempty"`
+    Wave             *int32                      `json:"wave,omitempty"`
+    Lockstep         bool                        `json:"lockstep,omitempty"`
     Backend          BackendConfig               `json:"backend"`
     RequeueInterval  string                      `json:"requeueInterval,omitempty"`
 }
@@ -167,9 +167,10 @@ type BackendConfig struct {
     Secret           string   `json:"secret,omitempty"`
 }
 
+// Deprecated, accepted and ignored.
 type EnvironmentRelationship struct {
     Environment string           `json:"environment"`
-    Type        RelationshipType `json:"type"` // "After" or "Alongside"
+    Type        RelationshipType `json:"type"`
 }
 ```
 

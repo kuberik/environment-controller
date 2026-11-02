@@ -174,6 +174,8 @@ Bypass when GitHub is unreachable or the cluster is dying:
 kubectl annotate environment X environments.kuberik.com/skip-deregister=true
 ```
 
+To replace an owner that can no longer deregister (rebuilt cluster, skip-deregister used), annotate the new Environment `environments.kuberik.com/take-over-site=true`: it posts a deregistration marker on each conflicting owner and registers as the owner.
+
 The controller also gives up (event plus finalizer removal) when the namespace is terminating and the token Secret is gone. If the controller itself is down:
 
 ```bash

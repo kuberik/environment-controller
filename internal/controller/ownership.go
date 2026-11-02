@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
+	"time"
 
 	"github.com/google/go-github/v62/github"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
@@ -58,16 +61,29 @@ func (o deploymentOwner) String() string {
 	return fmt.Sprintf("cluster %s namespace %s name %s", o.Cluster, o.Namespace, o.Name)
 }
 
+// clusterIDTimeout bounds the kube-system lookup so a stuck read can never
+// wedge every reconcile behind clusterMu.
+const clusterIDTimeout = 10 * time.Second
+
 // clusterID is the UID of namespace kube-system, looked up once and cached.
-// Tests may pre-set GitHubEnvironmentReconciler.ClusterID.
+// The lookup goes through APIReader (the manager's cache has no Namespace
+// informer and RBAC only grants get); r.Client is used only when APIReader is
+// nil (tests). Errors are returned and not cached. Tests may pre-set
+// GitHubEnvironmentReconciler.ClusterID.
 func (r *GitHubEnvironmentReconciler) clusterID(ctx context.Context) (string, error) {
 	r.clusterMu.Lock()
 	defer r.clusterMu.Unlock()
 	if r.ClusterID != "" {
 		return r.ClusterID, nil
 	}
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	ctx, cancel := context.WithTimeout(ctx, clusterIDTimeout)
+	defer cancel()
 	ns := &corev1.Namespace{}
-	if err := r.Get(ctx, types.NamespacedName{Name: metav1.NamespaceSystem}, ns); err != nil {
+	if err := reader.Get(ctx, types.NamespacedName{Name: metav1.NamespaceSystem}, ns); err != nil {
 		return "", fmt.Errorf("failed to read the cluster identity (namespace %s): %w", metav1.NamespaceSystem, err)
 	}
 	r.ClusterID = string(ns.UID)
@@ -89,19 +105,25 @@ func ownerMatches(recorded, self deploymentOwner) bool {
 	return recorded.isZero() || recorded == self
 }
 
-// findSiteConflict returns the active owner that keeps self from owning
-// (deploymentName, tier, site), or nil when self may register.
+// siteOwnerGroup is one owner's deployments of a site.
+type siteOwnerGroup struct {
+	owner             deploymentOwner
+	earliest, newest  int64
+	newestEnvironment string // GitHub environment of the newest deployment
+}
+
+// activeSiteOwners returns every owner of (deploymentName, tier, site) whose
+// newest deployment is not deregistered.
 //
 // Call budget: the list calls of every alias of the tier plus one status fetch
 // per owner (the newest deployment of each), shared with the rest of the
-// reconcile through the status cache.
-func (r *GitHubEnvironmentReconciler) findSiteConflict(ctx context.Context, gh *github.Client, owner, repo, deploymentName, tier, site string, self deploymentOwner) (*deploymentOwner, error) {
+// reconcile through the caches.
+func (r *GitHubEnvironmentReconciler) activeSiteOwners(ctx context.Context, gh *github.Client, owner, repo, deploymentName, tier, site string) ([]*siteOwnerGroup, error) {
 	deps, err := r.listTierDeployments(ctx, gh, owner, repo, formatDeploymentTask(deploymentName), deploymentName, canonicalEnv(tier))
 	if err != nil {
 		return nil, err
 	}
-	type group struct{ earliest, newest int64 }
-	groups := map[deploymentOwner]*group{}
+	groups := map[deploymentOwner]*siteOwnerGroup{}
 	for _, d := range deps {
 		p := r.extractDeploymentPayload(d)
 		if p == nil || p.Site != site || p.Owner == nil || p.Owner.isZero() {
@@ -109,37 +131,86 @@ func (r *GitHubEnvironmentReconciler) findSiteConflict(ctx context.Context, gh *
 		}
 		g := groups[*p.Owner]
 		if g == nil {
-			g = &group{earliest: d.GetID(), newest: d.GetID()}
+			g = &siteOwnerGroup{owner: *p.Owner, earliest: d.GetID(), newest: d.GetID(), newestEnvironment: d.GetEnvironment()}
 			groups[*p.Owner] = g
 		}
 		g.earliest = min(g.earliest, d.GetID())
-		g.newest = max(g.newest, d.GetID())
+		if d.GetID() > g.newest {
+			g.newest, g.newestEnvironment = d.GetID(), d.GetEnvironment()
+		}
 	}
-	var other *deploymentOwner
-	var otherEarliest int64
-	var selfEarliest int64
-	selfActive := false
-	for o, g := range groups {
+	var active []*siteOwnerGroup
+	for _, g := range groups {
 		statuses, err := r.fetchAllDeploymentStatuses(ctx, gh, owner, repo, g.newest)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read statuses of deployment %d: %w", g.newest, err)
 		}
-		if isDeregistered(statuses) {
-			continue
+		if !isDeregistered(statuses) {
+			active = append(active, g)
 		}
-		if o == self {
+	}
+	sort.Slice(active, func(i, j int) bool { return active[i].owner.String() < active[j].owner.String() })
+	return active, nil
+}
+
+// findSiteConflict returns the active owner that keeps self from owning
+// (deploymentName, tier, site), or nil when self may register.
+func (r *GitHubEnvironmentReconciler) findSiteConflict(ctx context.Context, gh *github.Client, owner, repo, deploymentName, tier, site string, self deploymentOwner) (*deploymentOwner, error) {
+	active, err := r.activeSiteOwners(ctx, gh, owner, repo, deploymentName, tier, site)
+	if err != nil {
+		return nil, err
+	}
+	var other *siteOwnerGroup
+	var selfEarliest int64
+	selfActive := false
+	for _, g := range active {
+		if g.owner == self {
 			selfActive, selfEarliest = true, g.earliest
 			continue
 		}
-		if other == nil || g.earliest < otherEarliest || (g.earliest == otherEarliest && o.String() < other.String()) {
-			oc := o
-			other, otherEarliest = &oc, g.earliest
+		if other == nil || g.earliest < other.earliest {
+			other = g
 		}
 	}
-	if other == nil || (selfActive && selfEarliest < otherEarliest) {
+	if other == nil || (selfActive && selfEarliest < other.earliest) {
 		return nil, nil
 	}
-	return other, nil
+	o := other.owner
+	return &o, nil
+}
+
+// takeOverSite deregisters every active owner of the site other than self by
+// posting a marker on its newest deployment (SiteTakeOverAnnotation). The old
+// owner, if still alive, then finds itself deregistered and self active.
+func (r *GitHubEnvironmentReconciler) takeOverSite(ctx context.Context, gh *github.Client, env *kuberikv1alpha1.Environment, self deploymentOwner) error {
+	owner, repo, err := parseProject(env.Spec.Backend.Project)
+	if err != nil {
+		return err
+	}
+	id := r.currentIdentity(env)
+	active, err := r.activeSiteOwners(ctx, gh, owner, repo, id.name, id.environment, id.site)
+	if err != nil {
+		return err
+	}
+	for _, g := range active {
+		if g.owner == self {
+			continue
+		}
+		reconcileCacheFrom(ctx).invalidate(g.newest)
+		_, _, err := gh.Repositories.CreateDeploymentStatus(ctx, owner, repo, g.newest, &github.DeploymentStatusRequest{
+			State:        github.String(stateInactive),
+			Description:  github.String(fmt.Sprintf(takeOverMarker, id.site, self.Cluster, self.Namespace, self.Name)),
+			Environment:  github.String(g.newestEnvironment),
+			AutoInactive: github.Bool(false),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to deregister owner %s: %w", g.owner, err)
+		}
+		msg := fmt.Sprintf("took over site %s from %s", id.site, g.owner)
+		log.FromContext(ctx).Info(msg)
+		r.event(env, corev1.EventTypeNormal, "SiteTakenOver", msg)
+	}
+	return nil
 }
 
 func isDuplicateSite(env *kuberikv1alpha1.Environment) bool {

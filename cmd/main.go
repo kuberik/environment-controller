@@ -197,6 +197,7 @@ func main() {
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
 		CacheTransport: cacheTransport,
+		APIReader:      mgr.GetAPIReader(),
 		DefaultSite:    defaultSite,
 		Recorder:       mgr.GetEventRecorderFor("environment-controller"),
 	}).SetupWithManager(mgr); err != nil {

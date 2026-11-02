@@ -129,6 +129,9 @@ type GitHubEnvironmentReconciler struct {
 	// UID of namespace kube-system, read on first use (tests may set it).
 	ClusterID string
 	clusterMu sync.Mutex
+	// APIReader reads the cluster identity uncached (the manager cache has no
+	// Namespace informer). Nil falls back to Client (tests).
+	APIReader client.Reader
 
 	// GitHubBaseURL overrides the GitHub API base URL (tests point it at a fake
 	// server). Empty means api.github.com.
@@ -187,6 +190,11 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, fmt.Errorf("unsupported backend: %s", deployment.Spec.Backend.Type)
 	}
 
+	// Report deprecations first so a missing Rollout/Secret does not hide them.
+	if err := r.reconcileDeprecations(ctx, deployment); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Get the referenced Rollout to get the current version
 	rollout, err := r.getReferencedRollout(ctx, deployment)
 	if err != nil {
@@ -198,10 +206,6 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	githubClient, err := r.getGitHubClient(ctx, deployment)
 	if err != nil {
 		logger.Error(err, "Failed to get GitHub client")
-		return ctrl.Result{}, err
-	}
-
-	if err := r.reconcileDeprecations(ctx, deployment); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -225,6 +229,17 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if err != nil {
 		logger.Error(err, "Failed to check site ownership")
 		return ctrl.Result{}, err
+	}
+	if conflict != nil && deployment.Annotations[SiteTakeOverAnnotation] == annotationTrue {
+		if err := r.takeOverSite(ctx, githubClient, deployment, self); err != nil {
+			logger.Error(err, "Failed to take over site")
+			return ctrl.Result{}, err
+		}
+		conflict, err = r.findSiteConflict(ctx, githubClient, owner, repo, ensureKuberikPrefix(deployment.Spec.Name), deployment.Spec.Environment, r.effectiveSite(deployment), self)
+		if err != nil {
+			logger.Error(err, "Failed to check site ownership")
+			return ctrl.Result{}, err
+		}
 	}
 	if conflict != nil {
 		if err := r.reconcileDuplicateSite(ctx, deployment, *conflict); err != nil {
@@ -1001,6 +1016,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 			if err != nil {
 				return fmt.Errorf("failed to create GitHub deployment: %w", err)
 			}
+			reconcileCacheFrom(ctx).invalidateList(listCacheKey(task, formattedEnv))
 			dep = created
 			keyToDeployment[key] = dep
 		}
@@ -1609,6 +1625,18 @@ func (r *GitHubEnvironmentReconciler) buildEnvironmentGraph(ctx context.Context,
 			envName, _ := wave.Canonical(env.Spec.Environment)
 			if !relevantEnvironments[envName] {
 				continue
+			}
+			// Live ownership check: a stored condition may be stale, and a
+			// sibling must never post for a site another cluster owns.
+			if env.Name != environment.Name {
+				sibSelf, err := r.selfOwner(ctx, env)
+				if err != nil {
+					continue
+				}
+				sibConflict, err := r.findSiteConflict(ctx, ghClient, owner, repo, ensureKuberikPrefix(env.Spec.Name), env.Spec.Environment, r.effectiveSite(env), sibSelf)
+				if err != nil || sibConflict != nil {
+					continue
+				}
 			}
 
 			// Always sync this environment's history to ensure GitHub deployments and statuses

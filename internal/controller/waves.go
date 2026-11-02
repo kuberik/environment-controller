@@ -46,6 +46,10 @@ const (
 	// SkipDeregisterAnnotation, when "true", removes the finalizer without any
 	// GitHub call (dead cluster, revoked token).
 	SkipDeregisterAnnotation = "environments.kuberik.com/skip-deregister"
+	annotationTrue           = "true"
+	// SiteTakeOverAnnotation, when "true" on an Environment in DuplicateSite
+	// conflict, deregisters the conflicting owners and takes the site.
+	SiteTakeOverAnnotation = "environments.kuberik.com/take-over-site"
 
 	// DefaultSiteName is the site of an Environment that sets no spec.site on a
 	// controller without a default site. Deployments in GitHub whose payload
@@ -72,6 +76,7 @@ const (
 	deploymentsPerPage   = 100
 	deploymentsPerSite   = 20
 	deregistrationMarker = "Deregistered: site %s removed"
+	takeOverMarker       = "Deregistered: site %s taken over by %s/%s/%s"
 )
 
 // effectiveSite is spec.site, else the controller default site, else
@@ -132,10 +137,34 @@ type reconcileCacheKey struct{}
 // is valid and caches nothing.
 type reconcileCache struct {
 	statuses map[int64][]*github.DeploymentStatus
+	// lists holds deployment lists by (task, GitHub environment).
+	lists map[string][]*github.Deployment
+}
+
+func listCacheKey(task, formattedEnv string) string { return task + "\x00" + formattedEnv }
+
+func (c *reconcileCache) getList(key string) ([]*github.Deployment, bool) {
+	if c == nil {
+		return nil, false
+	}
+	l, ok := c.lists[key]
+	return l, ok
+}
+
+func (c *reconcileCache) putList(key string, l []*github.Deployment) {
+	if c != nil {
+		c.lists[key] = l
+	}
+}
+
+func (c *reconcileCache) invalidateList(key string) {
+	if c != nil {
+		delete(c.lists, key)
+	}
 }
 
 func withReconcileCache(ctx context.Context) context.Context {
-	return context.WithValue(ctx, reconcileCacheKey{}, &reconcileCache{statuses: map[int64][]*github.DeploymentStatus{}})
+	return context.WithValue(ctx, reconcileCacheKey{}, &reconcileCache{statuses: map[int64][]*github.DeploymentStatus{}, lists: map[string][]*github.Deployment{}})
 }
 
 func reconcileCacheFrom(ctx context.Context) *reconcileCache {
@@ -246,6 +275,11 @@ func (r *GitHubEnvironmentReconciler) displayDeployments(ctx context.Context, gh
 // listEnvDeployments lists deployments of one GitHub environment, newest first,
 // paginated and capped at maxDeploymentPages x deploymentsPerPage.
 func (r *GitHubEnvironmentReconciler) listEnvDeployments(ctx context.Context, gh *github.Client, owner, repo, task, formattedEnv string) ([]*github.Deployment, error) {
+	cache := reconcileCacheFrom(ctx)
+	key := listCacheKey(task, formattedEnv)
+	if l, ok := cache.getList(key); ok {
+		return l, nil
+	}
 	var all []*github.Deployment
 	opts := &github.DeploymentsListOptions{
 		Task:        task,
@@ -263,6 +297,7 @@ func (r *GitHubEnvironmentReconciler) listEnvDeployments(ctx context.Context, gh
 		}
 		opts.Page = resp.NextPage
 	}
+	cache.putList(key, all)
 	return all, nil
 }
 
@@ -616,23 +651,28 @@ func (r *GitHubEnvironmentReconciler) deregisterSite(ctx context.Context, gh *gi
 		return nil
 	}
 
-	opts := &github.DeploymentsListOptions{Task: task, Environment: formattedEnv, ListOptions: github.ListOptions{PerPage: deploymentsPerPage}}
-	var newest *github.Deployment
-	for page := 0; page < maxDeploymentPages && newest == nil; page++ {
-		deps, resp, err := gh.Repositories.ListDeployments(ctx, owner, repo, opts)
-		if err != nil {
-			return fmt.Errorf("failed to list deployments: %w", err)
+	deps, err := r.listEnvDeployments(ctx, gh, owner, repo, task, formattedEnv)
+	if err != nil {
+		return err
+	}
+	// Mark self's newest deployment; failing that the newest ownerless one.
+	// Never another owner's.
+	var newest, ownerless *github.Deployment
+	for _, d := range deps { // newest first
+		p := r.extractDeploymentPayload(d)
+		if p == nil || p.Site != id.site {
+			continue
 		}
-		for _, d := range deps { // newest first
-			if p := r.extractDeploymentPayload(d); p != nil && p.Site == id.site {
-				newest = d
-				break
-			}
-		}
-		if resp.NextPage == 0 {
+		if p.Owner != nil && *p.Owner == self {
+			newest = d
 			break
 		}
-		opts.Page = resp.NextPage
+		if ownerless == nil && (p.Owner == nil || p.Owner.isZero()) {
+			ownerless = d
+		}
+	}
+	if newest == nil {
+		newest = ownerless
 	}
 	if newest == nil {
 		return nil
@@ -675,7 +715,7 @@ func (r *GitHubEnvironmentReconciler) reconcileDelete(ctx context.Context, env *
 	if !controllerutil.ContainsFinalizer(env, DeregisterFinalizer) {
 		return ctrl.Result{}, nil
 	}
-	if env.Annotations[SkipDeregisterAnnotation] == "true" {
+	if env.Annotations[SkipDeregisterAnnotation] == annotationTrue {
 		lg.Info("Skipping deregistration (annotation)")
 		return ctrl.Result{}, r.removeFinalizer(ctx, env)
 	}

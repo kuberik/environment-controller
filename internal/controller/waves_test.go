@@ -18,11 +18,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	k8sptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
@@ -792,6 +794,83 @@ var _ = Describe("Sites and waves", func() {
 			Expect(p).To(HaveKeyWithValue("owner", HaveKeyWithValue("cluster", "cluster-self")))
 		})
 
+		It("does not post for a sibling tier whose site another cluster owns", func() {
+			seedOwned(euSite, ownedBy("cluster-other", "team", "eu-owner"), wRevA, "v1", "Succeeded")
+			mkRollout(histEntry(1, wRevA, "v1"))
+			stg := mkEnv("app-staging", euSite, nil)
+			cur := get(stg)
+			cur.Spec.Environment = "staging"
+			Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+			mkEnv("app-prod", euSite, nil) // fresh: no stored DuplicateSite condition yet
+
+			reconcile(stg)
+			deps := fake.deploymentsOf(prodGH)
+			Expect(deps).To(HaveLen(1), "prod/%s is owned by another cluster", euSite)
+			Expect(deps[0].Statuses).To(HaveLen(1))
+			Expect(fake.deploymentsOf(stagGH)).NotTo(BeEmpty())
+		})
+
+		It("marks only the registering owner's own deployment on deregistration", func() {
+			// Winner A (self) registered first; loser B has the newer deployment.
+			a := seedOwned(euSite, ownedBy("cluster-self", ns, "eu"), wRevA, "v1", "Succeeded")
+			b := seedOwned(euSite, ownedBy("cluster-other", "team", "eu-owner"), wRevB, "v2", "Succeeded")
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", euSite, nil)
+			reconcile(e)
+			Expect(cond(e, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+
+			Expect(k8sClient.Delete(ctx, get(e))).To(Succeed())
+			reconcile(e)
+
+			last := func(id int64) string {
+				for _, d := range fake.deploymentsOf(prodGH) {
+					if d.ID == id {
+						return d.Statuses[len(d.Statuses)-1].Description
+					}
+				}
+				return ""
+			}
+			Expect(last(a)).To(HavePrefix(deregisteredPrefix))
+			Expect(last(b)).NotTo(HavePrefix(deregisteredPrefix))
+
+			// B is now the only active owner.
+			gh, err := rec.getGitHubClient(ctx, &kuberikv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns},
+				Spec:       kuberikv1alpha1.EnvironmentSpec{Backend: kuberikv1alpha1.BackendConfig{Type: "github", Project: "o/r", Secret: "github-token"}},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			conflict, err := rec.findSiteConflict(ctx, gh, "o", "r", ensureKuberikPrefix(wApp), "prod", euSite, deploymentOwner{Cluster: "cluster-other", Namespace: "team", Name: "eu-owner"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(conflict).To(BeNil())
+		})
+
+		It("takes over a site from another owner when annotated", func() {
+			rec.Recorder = record.NewFakeRecorder(10)
+			old := seedOwned(euSite, ownedBy("cluster-old", "team", "eu-owner"), wRevA, "v1", "Succeeded")
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", euSite, nil)
+			reconcile(e)
+			Expect(cond(e, ConditionWaveReady).Reason).To(Equal(ReasonDuplicateSite))
+			Expect(rec.Recorder.(*record.FakeRecorder).Events).To(Receive(ContainSubstring("DuplicateSite")))
+
+			cur := get(e)
+			cur.Annotations = map[string]string{SiteTakeOverAnnotation: "true"}
+			Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+			reconcile(e)
+
+			Expect(cond(e, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+			deps := fake.deploymentsOf(prodGH)
+			Expect(deps).To(HaveLen(2))
+			Expect(deps[0].ID).To(Equal(old))
+			marker := deps[0].Statuses[len(deps[0].Statuses)-1]
+			Expect(marker.Description).To(HavePrefix(deregisteredPrefix))
+			Expect(marker.Description).To(Equal(fmt.Sprintf("Deregistered: site %s taken over by cluster-self/%s/eu", euSite, ns)))
+			var p map[string]any
+			Expect(json.Unmarshal(decodedPayload(deps[1].Payload), &p)).To(Succeed())
+			Expect(p).To(HaveKeyWithValue("owner", HaveKeyWithValue("cluster", "cluster-self")))
+			Expect(rec.Recorder.(*record.FakeRecorder).Events).To(Receive(ContainSubstring("SiteTakenOver")))
+		})
+
 		It("lets the first registration win a race", func() {
 			// Both registered; the other owner's first deployment is older.
 			seedOwned(euSite, ownedBy("cluster-other", "team", "eu-owner"), wRevA, "v1", "Succeeded")
@@ -871,5 +950,28 @@ func TestCandidatesOfIncludesDeployedRelease(t *testing.T) {
 	c := candidatesOf(r)
 	if c["aaa"] != "v1" || c["bbb"] != "v2" || len(c) != 2 {
 		t.Fatalf("candidatesOf = %v, want aaa->v1, bbb->v2 only", c)
+	}
+}
+
+// clusterID reads kube-system through APIReader when set (the cached client has
+// no Namespace informer in the manager) and does not cache errors.
+func TestClusterIDUsesAPIReader(t *testing.T) {
+	sch := runtime.NewScheme()
+	if err := corev1.AddToScheme(sch); err != nil {
+		t.Fatal(err)
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: metav1.NamespaceSystem, UID: "uid-123"}}
+	// Client is nil: touching it would panic.
+	r := &GitHubEnvironmentReconciler{APIReader: fakeclient.NewClientBuilder().WithScheme(sch).Build()}
+	if _, err := r.clusterID(context.Background()); err == nil {
+		t.Fatal("expected an error when kube-system is missing")
+	}
+	if r.ClusterID != "" {
+		t.Fatal("error must not be cached")
+	}
+	r.APIReader = fakeclient.NewClientBuilder().WithScheme(sch).WithObjects(ns).Build()
+	id, err := r.clusterID(context.Background())
+	if err != nil || id != "uid-123" {
+		t.Fatalf("clusterID = %q, %v", id, err)
 	}
 }

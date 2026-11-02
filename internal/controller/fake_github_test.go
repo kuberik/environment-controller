@@ -14,7 +14,10 @@ import (
 // reconciler uses, in memory. It exists so wave tests never touch real GitHub:
 // the other clusters of a fleet are simulated by seeding their deployments and
 // statuses directly.
-const stateSuccess = "success"
+const (
+	stateSuccess       = "success"
+	deploymentsSegment = "deployments"
+)
 
 type fakeGitHub struct {
 	mu     sync.Mutex
@@ -58,18 +61,6 @@ func (f *fakeGitHub) callCount() int {
 	return len(f.calls)
 }
 
-func (f *fakeGitHub) countCalls(prefix string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	n := 0
-	for _, c := range f.calls {
-		if strings.HasPrefix(c, prefix) {
-			n++
-		}
-	}
-	return n
-}
-
 // statusListCalls counts GET .../deployments/{id}/statuses calls per deployment ID.
 func (f *fakeGitHub) statusListCalls() map[string]int {
 	f.mu.Lock()
@@ -77,7 +68,7 @@ func (f *fakeGitHub) statusListCalls() map[string]int {
 	out := map[string]int{}
 	for _, c := range f.calls {
 		parts := strings.Split(strings.TrimPrefix(c, "GET "), "/")
-		if strings.HasPrefix(c, "GET ") && len(parts) == 7 && parts[4] == "deployments" && parts[6] == "statuses" {
+		if strings.HasPrefix(c, "GET ") && len(parts) == 7 && parts[4] == deploymentsSegment && parts[6] == "statuses" {
 			out[parts[5]]++
 		}
 	}
@@ -91,7 +82,7 @@ func (f *fakeGitHub) getDeploymentCalls() int {
 	n := 0
 	for _, c := range f.calls {
 		parts := strings.Split(strings.TrimPrefix(c, "GET "), "/")
-		if strings.HasPrefix(c, "GET ") && len(parts) == 6 && parts[4] == "deployments" {
+		if strings.HasPrefix(c, "GET ") && len(parts) == 6 && parts[4] == deploymentsSegment {
 			n++
 		}
 	}
@@ -195,7 +186,7 @@ func (f *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 
 	// /repos/{owner}/{repo}/deployments[/{id}[/statuses]]
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) < 4 || parts[0] != "repos" || parts[3] != "deployments" {
+	if len(parts) < 4 || parts[0] != "repos" || parts[3] != deploymentsSegment {
 		http.NotFound(w, r)
 		return
 	}

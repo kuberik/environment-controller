@@ -52,6 +52,7 @@ const (
 	ConditionLockstepConsistent = "LockstepConsistent"
 
 	deregisteredPrefix = "Deregistered"
+	stateInactive      = "inactive"
 
 	// Member-state reader bounds, see readMembers.
 	maxDeploymentPages   = 10
@@ -91,7 +92,7 @@ func isDeregisteredStatus(s *github.DeploymentStatus) bool {
 }
 
 // isDeregistered reports whether a deployment's statuses (newest first) say its
-// site is deregistered. GitHub's automatic "inactive" statuses (no description),
+// site is deregistered. GitHub's automatic stateInactive statuses (no description),
 // which a later success in the same GitHub environment appends, do not bury the
 // marker; any other newer status means the site registered again.
 func isDeregistered(statuses []*github.DeploymentStatus) bool {
@@ -99,7 +100,7 @@ func isDeregistered(statuses []*github.DeploymentStatus) bool {
 		if isDeregisteredStatus(s) {
 			return true
 		}
-		if s.GetState() == "inactive" && s.GetDescription() == "" {
+		if s.GetState() == stateInactive && s.GetDescription() == "" {
 			continue
 		}
 		return false
@@ -640,7 +641,7 @@ func (r *GitHubEnvironmentReconciler) deregisterSite(ctx context.Context, gh *gi
 	}
 	reconcileCacheFrom(ctx).invalidate(newest.GetID())
 	_, _, err = gh.Repositories.CreateDeploymentStatus(ctx, owner, repo, newest.GetID(), &github.DeploymentStatusRequest{
-		State:        github.String("inactive"),
+		State:        github.String(stateInactive),
 		Description:  github.String(fmt.Sprintf(deregistrationMarker, id.site)),
 		Environment:  &formattedEnv,
 		AutoInactive: github.Bool(false),

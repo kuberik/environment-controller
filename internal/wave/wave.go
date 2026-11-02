@@ -73,6 +73,8 @@ limitations under the License.
 // InvalidTopology). The same check applies to the upstream environment.
 package wave
 
+import "sort"
+
 // Bake states as the controller writes them; they match the rollout
 // controller's BakeStatus strings. Empty means unknown.
 const (
@@ -199,13 +201,130 @@ type Decision struct {
 
 // Decide computes Self's role and gate. Pure; see the package doc for the rules.
 func Decide(in Input) Decision {
-	panic("wave.Decide: not implemented")
+	s := in.Self
+	own := newFleet(s.Environment, in.Members, selfMember(in))
+	st := own.state(s.Wave)
+
+	d := Decision{
+		Role:             RoleFollower,
+		Leader:           st.leader,
+		SelectedRevision: st.selRev,
+		Mismatch:         own.mismatch(),
+	}
+	if st.leader == s.Site {
+		d.Role = RoleLeader
+	}
+
+	// Topology problems block everything.
+	if b := own.topology(); b != nil {
+		return blocked(d, b)
+	}
+	// DECISION: an upstream wave gap blocks every role, followers included,
+	// because the contract says it takes precedence over everything.
+	var up fleet
+	hasUpstream := s.Upstream != "" && s.Upstream != s.Environment
+	sitedUpstream := hasUpstream && !in.UpstreamSiteless
+	if sitedUpstream {
+		up = newFleet(s.Upstream, in.Members, nil)
+		if b := up.topology(); b != nil {
+			return blocked(d, b)
+		}
+	}
+
+	if d.Role == RoleFollower {
+		return decideFollower(d, in, st)
+	}
+
+	// Wave-1 leader with lockstep: pinned to the current selection until the
+	// whole environment baked it.
+	if s.Wave == 1 && s.Lockstep && st.selRev != "" {
+		if b := own.lockstepBlocker(st.selRev); b != nil {
+			d.Unrestricted = false
+			d.AllowedTags = tagList(map[string]int64{st.selRev: 0}, in.Candidates)
+			d.Blocker = b
+			return d
+		}
+	}
+
+	var revs map[string]int64
+	var prev waveState
+	var prevEnv string
+	switch {
+	case s.Wave > 1:
+		prev, prevEnv = own.state(s.Wave-1), s.Environment
+		revs = completedRevs(prev.reg)
+	case !hasUpstream:
+		d.Unrestricted = true
+		return d
+	case in.UpstreamSiteless:
+		revs = map[string]int64{}
+		for _, r := range in.UpstreamBaked {
+			revs[r] = 0
+		}
+	default:
+		prevEnv = s.Upstream
+		prev = up.state(up.lastWave())
+		revs = completedRevs(prev.reg)
+	}
+
+	d.AllowedTags = tagList(revs, in.Candidates)
+	if len(d.AllowedTags) == 0 {
+		if in.UpstreamSiteless && s.Wave == 1 {
+			// DECISION: nothing baked upstream yet; there is no member to name.
+			d.Blocker = &Blocker{Reason: ReasonWaitingFor, Message: s.Upstream + " has no baked revision"}
+		} else {
+			d.Blocker = prev.blocker(prevEnv)
+		}
+	}
+	return d
+}
+
+func blocked(d Decision, b *Blocker) Decision {
+	d.Unrestricted = false
+	d.AllowedTags = []string{}
+	d.Blocker = b
+	return d
+}
+
+func decideFollower(d Decision, in Input, st waveState) Decision {
+	env := in.Self.Environment
+	d.AllowedTags = []string{}
+	if st.selRev == "" {
+		d.Blocker = &Blocker{Reason: ReasonWaitingFor, Message: env + "/" + st.leader + " selection"}
+		return d
+	}
+	tag, ok := in.Candidates[st.selRev]
+	if !ok || tag == "" {
+		d.Blocker = &Blocker{Reason: ReasonWaitingForCandidate, Message: short(st.selRev)}
+		return d
+	}
+	d.AllowedTags = []string{tag}
+	if p := in.Self.PinnedVersion; p != "" && p != tag {
+		d.Blocker = &Blocker{Reason: ReasonPinned, Message: "pinned to " + p + ", wave selected " + tag}
+	}
+	return d
 }
 
 // UpstreamComplete returns the revisions that fully completed the given sited
 // environment: baked Succeeded by every registered member of its last wave. It
 // returns a Blocker (InvalidTopology) when the environment's waves have a gap.
 // Used directly by site-less Environments whose upstream is sited.
+// Revisions are ordered newest first (ties by revision).
 func UpstreamComplete(env string, members []Member) ([]string, *Blocker) {
-	panic("wave.UpstreamComplete: not implemented")
+	f := newFleet(env, members, nil)
+	if b := f.topology(); b != nil {
+		return nil, b
+	}
+	revs := completedRevs(f.state(f.lastWave()).reg)
+	out := make([]string, 0, len(revs))
+	for r := range revs {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if revs[out[i]] != revs[out[j]] {
+			return revs[out[i]] > revs[out[j]]
+		}
+		return out[i] < out[j]
+	})
+	return out, nil
 }

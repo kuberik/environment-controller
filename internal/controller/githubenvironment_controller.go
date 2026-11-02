@@ -201,10 +201,10 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
-	// Build relationship graph
+	// Build the environment graph
 	graphData, err := r.buildEnvironmentGraph(ctx, deployment, githubClient)
 	if err != nil {
-		logger.Error(err, "Failed to build relationship graph")
+		logger.Error(err, "Failed to build environment graph")
 		return ctrl.Result{}, err
 	}
 
@@ -221,7 +221,7 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	// Update allowed versions on RolloutGate. Sited: wave.Decide (status.wave and
-	// conditions are written before the gate). Site-less: relationship logic, via
+	// conditions are written before the gate). Site-less: tier ordering, via
 	// wave.UpstreamComplete only when the upstream environment is sited.
 	if site != "" {
 		if err := r.reconcileWave(ctx, githubClient, deployment, rollout); err != nil {
@@ -229,7 +229,7 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			return ctrl.Result{}, err
 		}
 	} else if err := r.updateAllowedVersions(ctx, githubClient, deployment, rollout); err != nil {
-		logger.Error(err, "Failed to update allowed versions from relationships")
+		logger.Error(err, "Failed to update allowed versions from tier order")
 		return ctrl.Result{}, err
 	}
 
@@ -923,7 +923,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 
 		if dep == nil {
 			// Create missing deployment for this history entry
-			// Only store immutable data in payload: ID, relationship, and version
+			// Only store immutable data in payload: ID, site, wave and version
 			// Status and other mutable fields come from GitHub deployment statuses
 			payload := deploymentPayload{
 				ID:      historyID,

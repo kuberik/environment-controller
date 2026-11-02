@@ -60,8 +60,23 @@ spec:
                 - type
                 type: object
               environment:
-                description: Environment is the environment name (e.g., "production",
-                  "staging")
+                description: |-
+                  Environment is the tier this Environment belongs to. Tiers have a fixed
+                  order, earliest first: dev, test, staging, prod. Each tier accepts the
+                  aliases listed below; aliases of one tier are the same environment for
+                  wave grouping, upstream lookup and GitHub matching (the GitHub
+                  environment name is kept as written here). An Environment is gated on
+                  the nearest earlier tier that has registered sites for the same name.
+                enum:
+                - dev
+                - development
+                - test
+                - qa
+                - staging
+                - stage
+                - preprod
+                - prod
+                - production
                 type: string
               lockstep:
                 description: |-
@@ -75,28 +90,6 @@ spec:
                   prefix will be automatically added for GitHub backend if not already
                   present)
                 type: string
-              relationship:
-                description: Relationship defines how this environment relates to
-                  another environment
-                properties:
-                  environment:
-                    description: Environment is the environment name this environment
-                      relates to
-                    type: string
-                  type:
-                    description: |-
-                      Type is the type of relationship:
-                      - "After": deploy a version only once it has been successfully deployed to the related environment.
-                      - "Alongside": deploy the same version as the related environment as soon as that environment
-                        starts deploying it, unless its deployment there failed or was cancelled.
-                    enum:
-                    - After
-                    - Alongside
-                    type: string
-                required:
-                - environment
-                - type
-                type: object
               requeueInterval:
                 description: |-
                   RequeueInterval specifies how often the controller should reconcile this Environment
@@ -140,6 +133,7 @@ spec:
                 type: integer
             required:
             - backend
+            - environment
             - name
             - rolloutRef
             type: object
@@ -227,7 +221,8 @@ spec:
                     deployment.
                   properties:
                     environment:
-                      description: Environment is the environment name
+                      description: Environment is the canonical tier name (dev, test,
+                        staging, prod)
                       type: string
                     environmentUrl:
                       description: EnvironmentURL is the URL of the actual deployed
@@ -364,28 +359,6 @@ spec:
                         type: object
                       type: array
                       x-kubernetes-list-type: atomic
-                    relationship:
-                      description: Relationship defines how this environment relates
-                        to another environment
-                      properties:
-                        environment:
-                          description: Environment is the environment name this environment
-                            relates to
-                          type: string
-                        type:
-                          description: |-
-                            Type is the type of relationship:
-                            - "After": deploy a version only once it has been successfully deployed to the related environment.
-                            - "Alongside": deploy the same version as the related environment as soon as that environment
-                              starts deploying it, unless its deployment there failed or was cancelled.
-                          enum:
-                          - After
-                          - Alongside
-                          type: string
-                      required:
-                      - environment
-                      - type
-                      type: object
                   required:
                   - environment
                   type: object

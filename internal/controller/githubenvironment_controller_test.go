@@ -92,11 +92,10 @@ var _ = Describe("Environment Controller", func() {
 
 	// Helper function to create deployment payload with history entry
 	createDeploymentPayload := func(historyID string, historyEntry *kuberikrolloutv1alpha1.DeploymentHistoryEntry) ([]byte, error) {
-		// New payload format: only immutable data (ID, Relationship, Version)
+		// New payload format: only immutable data (ID, Version)
 		payload := struct {
-			ID           string                                   `json:"id"`
-			Relationship *kuberikv1alpha1.EnvironmentRelationship `json:"relationship,omitempty"`
-			Version      *kuberikrolloutv1alpha1.VersionInfo      `json:"version,omitempty"`
+			ID      string                              `json:"id"`
+			Version *kuberikrolloutv1alpha1.VersionInfo `json:"version,omitempty"`
 		}{
 			ID:      historyID,
 			Version: historyEntry.Version.DeepCopy(),
@@ -991,7 +990,7 @@ var _ = Describe("Environment Controller", func() {
 			Expect(updatedDeployment.Status.EnvironmentInfos).ToNot(BeEmpty())
 			foundInfo := false
 			for _, info := range updatedDeployment.Status.EnvironmentInfos {
-				if info.Environment == "production" {
+				if info.Environment == "prod" {
 					foundInfo = true
 					// Expect(info.EnvironmentURL).ToNot(BeEmpty()) // URL generation depends on Gateway/Ingress which might not be present in test
 					Expect(info.History).ToNot(BeEmpty())
@@ -1558,7 +1557,7 @@ var _ = Describe("Environment Controller", func() {
 			Expect(updatedDeployment.Status.RolloutGateRef.Name).To(HavePrefix("ghd-"))
 		})
 
-		It("Should update allowed versions from relationships", func() {
+		It("Should update allowed versions from tier order", func() {
 			skipIfNoGitHubToken()
 
 			By("Creating GitHub token secret")
@@ -1572,7 +1571,7 @@ var _ = Describe("Environment Controller", func() {
 			By("Creating staging deployment with success status")
 			// First create a related deployment (staging)
 			// Use a commit SHA as the revision (GitHub deployment ref)
-			// Relationships are for the same deployment name but different environment
+			// Tiers are for the same deployment name but different environment
 			// So we create "test-deployment-deps/staging" environment
 			stagingRef := "0a9c600d3a75bcb7ec54dcef3b03e0d7fe0598d7"
 			stagingTag := "v1.0.0" // Tag that matches the staging revision
@@ -1650,7 +1649,7 @@ var _ = Describe("Environment Controller", func() {
 			}
 			Expect(k8sClient.Status().Update(context.Background(), rollout)).Should(Succeed())
 
-			By("Creating Deployment with relationship")
+			By("Creating Deployment with tier order")
 			deployment := &kuberikv1alpha1.Environment{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-github-deployment-deps",
@@ -1666,17 +1665,13 @@ var _ = Describe("Environment Controller", func() {
 					},
 					Name:        "test-deployment-deps",
 					Environment: "production",
-					Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-						Environment: "staging",
-						Type:        kuberikv1alpha1.RelationshipTypeAfter,
-					},
 				},
 			}
 			// Delete if exists first
 			_ = k8sClient.Delete(context.Background(), deployment)
 			Expect(k8sClient.Create(context.Background(), deployment)).Should(Succeed())
 
-			By("Reconciling Deployment with relationship")
+			By("Reconciling Deployment with tier order")
 			req := ctrl.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      "test-github-deployment-deps",
@@ -1688,7 +1683,7 @@ var _ = Describe("Environment Controller", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(time.Minute))
 
-			By("Verifying allowed versions were updated from relationships on RolloutGate")
+			By("Verifying allowed versions were updated from tier order on RolloutGate")
 			updatedDeployment := &kuberikv1alpha1.Environment{}
 			Expect(k8sClient.Get(context.Background(), types.NamespacedName{
 				Name:      "test-github-deployment-deps",
@@ -1798,7 +1793,7 @@ var _ = Describe("Environment Controller", func() {
 			Expect(updatedDeployment.Status.EnvironmentInfos).ToNot(BeEmpty())
 			var productionInfo *kuberikv1alpha1.EnvironmentInfo
 			for i := range updatedDeployment.Status.EnvironmentInfos {
-				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "production" {
+				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "prod" {
 					productionInfo = &updatedDeployment.Status.EnvironmentInfos[i]
 					break
 				}
@@ -1821,7 +1816,7 @@ var _ = Describe("Environment Controller", func() {
 			Expect(revisionsFound[revision2]).To(BeTrue())
 		})
 
-		It("Should track relevant versions based on relationships", func() {
+		It("Should track relevant versions based on tier order", func() {
 			skipIfNoGitHubToken()
 
 			By("Creating GitHub token secret")
@@ -1918,10 +1913,6 @@ var _ = Describe("Environment Controller", func() {
 					},
 					Name:        "test-deployment-relevant",
 					Environment: "production",
-					Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-						Environment: "staging",
-						Type:        kuberikv1alpha1.RelationshipTypeAfter,
-					},
 				},
 			}
 			// Delete if exists first
@@ -2051,7 +2042,7 @@ var _ = Describe("Environment Controller", func() {
 
 			var productionInfo *kuberikv1alpha1.EnvironmentInfo
 			for i := range updatedDeployment.Status.EnvironmentInfos {
-				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "production" {
+				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "prod" {
 					productionInfo = &updatedDeployment.Status.EnvironmentInfos[i]
 					break
 				}
@@ -2112,7 +2103,7 @@ var _ = Describe("Environment Controller", func() {
 			// Get updated production info
 			productionInfo = nil
 			for i := range updatedDeployment.Status.EnvironmentInfos {
-				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "production" {
+				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "prod" {
 					productionInfo = &updatedDeployment.Status.EnvironmentInfos[i]
 					break
 				}
@@ -2227,7 +2218,7 @@ var _ = Describe("Environment Controller", func() {
 
 			var productionInfo *kuberikv1alpha1.EnvironmentInfo
 			for i := range updatedDeployment.Status.EnvironmentInfos {
-				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "production" {
+				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "prod" {
 					productionInfo = &updatedDeployment.Status.EnvironmentInfos[i]
 					break
 				}
@@ -2263,7 +2254,7 @@ var _ = Describe("Environment Controller", func() {
 			// Get updated production info
 			productionInfo = nil
 			for i := range updatedDeployment.Status.EnvironmentInfos {
-				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "production" {
+				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "prod" {
 					productionInfo = &updatedDeployment.Status.EnvironmentInfos[i]
 					break
 				}
@@ -2281,7 +2272,7 @@ var _ = Describe("Environment Controller", func() {
 			Expect(revisionsFound[revision1]).To(BeFalse(), "revision1 should be removed from History")
 		})
 
-		It("Should update DeploymentStatuses for related environments based on relationships", func() {
+		It("Should update DeploymentStatuses for related environments based on tier order", func() {
 			skipIfNoGitHubToken()
 
 			By("Creating GitHub token secret")
@@ -2377,10 +2368,6 @@ var _ = Describe("Environment Controller", func() {
 					},
 					Name:        "test-deployment-status-env",
 					Environment: "production",
-					Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-						Environment: "staging",
-						Type:        kuberikv1alpha1.RelationshipTypeAfter,
-					},
 				},
 			}
 			// Delete if exists first
@@ -2409,7 +2396,7 @@ var _ = Describe("Environment Controller", func() {
 			// Should have status entries for production (current environment)
 			var productionInfo *kuberikv1alpha1.EnvironmentInfo
 			for i := range updatedDeployment.Status.EnvironmentInfos {
-				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "production" {
+				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "prod" {
 					productionInfo = &updatedDeployment.Status.EnvironmentInfos[i]
 					break
 				}
@@ -2545,10 +2532,6 @@ var _ = Describe("Environment Controller", func() {
 					},
 					Name:        "test-deployment-related-env",
 					Environment: "production",
-					Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-						Environment: "staging",
-						Type:        kuberikv1alpha1.RelationshipTypeAfter,
-					},
 				},
 			}
 			_ = k8sClient.Delete(context.Background(), productionEnv)
@@ -2575,7 +2558,7 @@ var _ = Describe("Environment Controller", func() {
 
 			var productionInfo *kuberikv1alpha1.EnvironmentInfo
 			for i := range updatedProductionEnv.Status.EnvironmentInfos {
-				if updatedProductionEnv.Status.EnvironmentInfos[i].Environment == "production" {
+				if updatedProductionEnv.Status.EnvironmentInfos[i].Environment == "prod" {
 					productionInfo = &updatedProductionEnv.Status.EnvironmentInfos[i]
 					break
 				}
@@ -2738,10 +2721,6 @@ var _ = Describe("Environment Controller", func() {
 					},
 					Name:        "test-deployment-update-env",
 					Environment: "production",
-					Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-						Environment: "staging",
-						Type:        kuberikv1alpha1.RelationshipTypeAfter,
-					},
 				},
 			}
 			_ = k8sClient.Delete(context.Background(), productionEnv)
@@ -2963,10 +2942,6 @@ var _ = Describe("Environment Controller", func() {
 					},
 					Name:        "test-deployment-relevant-graph",
 					Environment: "production",
-					Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-						Environment: "staging",
-						Type:        kuberikv1alpha1.RelationshipTypeAfter,
-					},
 				},
 			}
 			// Delete if exists first
@@ -3114,7 +3089,7 @@ var _ = Describe("Environment Controller", func() {
 			// Get production environment info to find all deployment IDs
 			var productionInfo *kuberikv1alpha1.EnvironmentInfo
 			for i := range updatedDeployment.Status.EnvironmentInfos {
-				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "production" {
+				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "prod" {
 					productionInfo = &updatedDeployment.Status.EnvironmentInfos[i]
 					break
 				}
@@ -3201,7 +3176,7 @@ var _ = Describe("Environment Controller", func() {
 
 			productionInfo = nil
 			for i := range updatedDeployment.Status.EnvironmentInfos {
-				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "production" {
+				if updatedDeployment.Status.EnvironmentInfos[i].Environment == "prod" {
 					productionInfo = &updatedDeployment.Status.EnvironmentInfos[i]
 					break
 				}
@@ -3387,10 +3362,6 @@ var _ = Describe("Environment Controller", func() {
 				},
 				Name:        "test-deployment-preserve",
 				Environment: "staging",
-				Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-					Environment: "dev",
-					Type:        kuberikv1alpha1.RelationshipTypeAfter,
-				},
 			},
 		}
 		_ = k8sClient.Delete(context.Background(), stagingEnv)

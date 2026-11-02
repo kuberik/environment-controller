@@ -14,11 +14,11 @@ func TestBuildEnvironmentInfos_LimitsHistoryForIndirectConnections(t *testing.T)
 	r := &GitHubEnvironmentReconciler{}
 
 	// Define environments
-	// env-a (current)
-	// env-b (depends on env-a) -> Direct
-	// env-c (depends on env-b) -> Indirect
+	// dev (current)
+	// test (next tier) -> Direct
+	// staging (two tiers on) -> Indirect
 
-	currentEnvName := "env-a"
+	currentEnvName := "dev"
 
 	envA := &kuberikv1alpha1.Environment{
 		Spec: kuberikv1alpha1.EnvironmentSpec{
@@ -44,21 +44,16 @@ func TestBuildEnvironmentInfos_LimitsHistoryForIndirectConnections(t *testing.T)
 		return h
 	}
 
-	relationships := map[string]*kuberikv1alpha1.EnvironmentRelationship{
-		"env-b": {Environment: "env-a"},
-		"env-c": {Environment: "env-b"},
-	}
-
-	graphData := &relationshipGraphData{
+	graphData := &environmentGraphData{
 		environmentInfos: map[string]environmentInfo{
-			"env-a": {Relationship: nil},
-			"env-b": {Relationship: relationships["env-b"]},
-			"env-c": {Relationship: relationships["env-c"]},
+			"dev":     {},
+			"test":    {},
+			"staging": {},
 		},
 		envHistory: map[string][]kuberikrolloutv1alpha1.DeploymentHistoryEntry{
-			"env-a": createHistory(3),
-			"env-b": createHistory(3),
-			"env-c": createHistory(3),
+			"dev":     createHistory(3),
+			"test":    createHistory(3),
+			"staging": createHistory(3),
 		},
 	}
 
@@ -83,14 +78,14 @@ func TestBuildEnvironmentInfos_LimitsHistoryForIndirectConnections(t *testing.T)
 		}
 	}
 
-	// env-a: Current env, should have full history
-	assertHistoryLen("env-a", 3)
+	// dev: Current env, should have full history
+	assertHistoryLen("dev", 3)
 
-	// env-b: Directly connected (depends on current), should have full history
-	assertHistoryLen("env-b", 3)
+	// test: Directly connected (depends on current), should have full history
+	assertHistoryLen("test", 3)
 
-	// env-c: Indirectly connected, should have LIMITED history (1)
-	assertHistoryLen("env-c", 1)
+	// staging: Indirectly connected, should have LIMITED history (1)
+	assertHistoryLen("staging", 1)
 }
 
 func TestUpdateEnvironmentInfoWithHistory_RemovesDuplicates(t *testing.T) {
@@ -120,7 +115,7 @@ func TestUpdateEnvironmentInfoWithHistory_RemovesDuplicates(t *testing.T) {
 	}
 
 	// Executue with nil relationship/url as they don't matter
-	infos := updateEnvironmentInfoWithHistory(nil, "env", "url", nil, history)
+	infos := updateEnvironmentInfoWithHistory(nil, "env", "url", history)
 
 	// Assert
 	if len(infos) != 1 {

@@ -69,6 +69,9 @@ limitations under the License.
 //   - Missing or unreadable bake status counts as not done.
 //   - Revisions are mapped to tags through Input.Candidates; a revision without a
 //     tag is dropped (WaitingForCandidate when that empties a follower's set).
+//   - A leader whose newest allowed release is the one it already runs
+//     (Input.Current) while the previous wave (or upstream) still has a newer
+//     selection in flight is not Ready: Blocker names the member it waits for.
 //
 // Lockstep: if the wave-1 leader's own spec has Lockstep and the current wave-1
 // selection is not yet baked Succeeded by every registered member of every wave
@@ -181,8 +184,12 @@ type Input struct {
 	// Succeeded (today's single-stream logic).
 	UpstreamSiteless bool
 	UpstreamBaked    []string
-	// Candidates maps revision -> tag from the local Rollout's releaseCandidates.
+	// Candidates maps revision -> tag from the local Rollout's releaseCandidates
+	// and availableReleases (so the release the site already runs maps too).
 	Candidates map[string]string
+	// Current is the revision the local Rollout runs now ("" unknown). Only
+	// used to tell "up to date, waiting for the previous wave" from Ready.
+	Current string
 }
 
 // Blocker explains why a site cannot progress. Message names the blocker, e.g.
@@ -298,6 +305,12 @@ func Decide(in Input) Decision {
 		} else {
 			d.Blocker = prev.blocker(prevEnv)
 		}
+	} else if _, done := revs[prev.selRev]; prev.selRev != "" && !done &&
+		in.Current != "" && d.AllowedTags[0] == in.Candidates[in.Current] {
+		// The newest allowed release is the one this site already runs, and
+		// the previous wave's newer selection is still in flight: nothing to
+		// deploy yet, so name who the site is waiting for instead of Ready.
+		d.Blocker = prev.blocker(prevEnv)
 	}
 	return d
 }

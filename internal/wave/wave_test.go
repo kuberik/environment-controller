@@ -117,6 +117,25 @@ func TestDecide(t *testing.T) {
 			role: RoleFollower, leader: "a", selected: A, allowed: []string{"v1"}, checkAllowd: true,
 		},
 		{
+			// Live demo: wave 2 kept saying Ready while wave 1 was still rolling
+			// a newer selection, because the release it already ran was allowed.
+			name: "wave-2 leader names the wave-1 member still baking the newer selection",
+			in: Input{Self: self("c", 2), Candidates: cands, Current: A, Members: []Member{
+				m("prod", "a", 1, d(A, 10, ok, true), d(B, 20, ok, true)),
+				m("prod", "b", 1, d(A, 11, ok, false), d(B, 21, BakeInProgress, false)),
+				m("prod", "c", 2, d(A, 12, ok, true))}},
+			role: RoleLeader, leader: "c", selected: A, allowed: []string{"v1"}, checkAllowd: true,
+			reason: ReasonWaitingFor, msg: "prod/b bake on bbbbbbb", checkMsg: true,
+		},
+		{
+			name: "wave-2 leader already on the completed selection is ready",
+			in: Input{Self: self("c", 2), Candidates: cands, Current: B, Members: []Member{
+				m("prod", "a", 1, d(B, 20, ok, true)),
+				m("prod", "b", 1, d(B, 21, ok, false)),
+				m("prod", "c", 2, d(B, 22, ok, true))}},
+			role: RoleLeader, leader: "c", selected: B, allowed: []string{"v2"}, checkAllowd: true,
+		},
+		{
 			name: "wave-2 leader gated on all wave-1 members",
 			in: Input{Self: self("c", 2), Candidates: cands, Members: []Member{
 				m("prod", "a", 1, d(A, 10, ok, true), d(B, 20, ok, true)),

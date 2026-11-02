@@ -377,6 +377,14 @@ func candidatesOf(rollout *kuberikrolloutv1alpha1.Rollout) map[string]string {
 	return c
 }
 
+// currentRevision is the revision of the Rollout's newest history entry.
+func currentRevision(rollout *kuberikrolloutv1alpha1.Rollout) string {
+	if len(rollout.Status.History) == 0 || rollout.Status.History[0].Version.Revision == nil {
+		return ""
+	}
+	return *rollout.Status.History[0].Version.Revision
+}
+
 func sitedRegistered(members []wave.Member, env string) bool {
 	for _, m := range members {
 		if m.Environment == env && m.Site != "" && !m.Deregistered {
@@ -442,6 +450,7 @@ func (r *GitHubEnvironmentReconciler) reconcileWave(ctx context.Context, gh *git
 		},
 		Members:    members,
 		Candidates: candidatesOf(rollout),
+		Current:    currentRevision(rollout),
 	}
 	if upstream != "" && upstream != env.Spec.Environment && !sitedRegistered(members, upstream) {
 		in.UpstreamSiteless = true

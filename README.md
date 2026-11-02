@@ -119,7 +119,7 @@ When the wave-1 leader sets `lockstep: true`, its allowed set is pinned to the c
 | Condition | Status / Reason | Meaning |
 | --- | --- | --- |
 | `WaveReady` | `True` / `Ready` | The site may deploy the allowed versions. |
-| `WaveReady` | `False` / `WaitingFor` | Waiting for a named member to bake (message names it). |
+| `WaveReady` | `False` / `WaitingFor` | Waiting for a named member to bake (message names it). Also set on a follower when the leader's bake of the selected revision is Failed or Cancelled (`prod/us-east-1 bake failed on 1a2b3c4`): like Alongside, the version drops out of the follower's gate. A follower that already started it keeps going. |
 | `WaveReady` | `False` / `WaitingForCandidate` | The wanted revision has no release-candidate tag yet. |
 | `WaveReady` | `False` / `Pinned` | The Rollout pins `spec.wantedVersion`. |
 | `WaveReady` | `False` / `InvalidTopology` | Waves have a gap (this or the upstream environment). |
@@ -135,6 +135,8 @@ The GitHub environment stays `kuberik/<name>/<environment>` and the task `deploy
 Sited Environments carry the finalizer `environments.kuberik.com/deregister`. On delete the controller posts an `inactive` status `Deregistered: site <site> removed` (always with `auto_inactive: false`) on the site's newest deployment and removes the finalizer. A deregistered site no longer counts for membership, leadership or completion; its past selection records still do. GitHub's automatic `inactive` statuses (no description) appended after the marker do not undo it; any other newer status (the site deploys again) re-registers it.
 
 The identity written to GitHub (deployment name, environment, site) is recorded in `status.wave` before the first GitHub write. Changing `spec.site`, `spec.environment` or `spec.name` deregisters the old identity first, then records the new one. Removing the site altogether deregisters, releases the finalizer and clears `status.wave` and the wave conditions. Re-registering the same site simply posts fresh statuses.
+
+Deleting an Environment removes the site from its wave, and its Rollout then deploys freely (the RolloutGate is garbage-collected with the Environment).
 
 Wave and lockstep changes reach the other sites only with this site's next deployment, because both are read from the newest deployment's payload.
 

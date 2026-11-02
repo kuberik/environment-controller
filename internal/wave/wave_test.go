@@ -104,6 +104,32 @@ func TestDecide(t *testing.T) {
 			allowed: []string{}, checkAllowd: true,
 		},
 		{
+			name: "follower: leader bake Failed drops the version",
+			in: Input{Self: self("b", 1), Candidates: cands, Members: []Member{
+				m("prod", "a", 1, d(A, 10, BakeFailed, true))}},
+			role: RoleFollower, leader: "a", selected: A, reason: ReasonWaitingFor, msg: "prod/a bake failed on aaaaaaa", checkMsg: true,
+			allowed: []string{}, checkAllowd: true,
+		},
+		{
+			name: "follower: leader bake Cancelled drops the version",
+			in: Input{Self: self("b", 1), Candidates: cands, Members: []Member{
+				m("prod", "a", 1, d(A, 10, BakeCancelled, true))}},
+			role: RoleFollower, leader: "a", selected: A, reason: ReasonWaitingFor, msg: "prod/a bake cancelled on aaaaaaa", checkMsg: true,
+			allowed: []string{}, checkAllowd: true,
+		},
+		{
+			name: "follower: leader bake Deploying keeps the version",
+			in: Input{Self: self("b", 1), Candidates: cands, Members: []Member{
+				m("prod", "a", 1, d(A, 10, BakeDeploying, true))}},
+			role: RoleFollower, leader: "a", selected: A, allowed: []string{"v1"}, checkAllowd: true,
+		},
+		{
+			name: "follower: leader bake Succeeded keeps the version",
+			in: Input{Self: self("b", 1), Candidates: cands, Members: []Member{
+				m("prod", "a", 1, d(A, 10, BakeSucceeded, true))}},
+			role: RoleFollower, leader: "a", selected: A, allowed: []string{"v1"}, checkAllowd: true,
+		},
+		{
 			name: "pinned follower",
 			in: Input{Self: Self{Environment: "prod", Site: "b", Wave: 1, PinnedVersion: "v0"}, Candidates: cands,
 				Members: []Member{m("prod", "a", 1, d(A, 10, "", true))}},

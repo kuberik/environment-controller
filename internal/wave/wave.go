@@ -87,7 +87,10 @@ limitations under the License.
 // InvalidTopology). The same check applies to the upstream environment.
 package wave
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // Bake states as the controller writes them; they match the rollout
 // controller's BakeStatus strings. Empty means unknown.
@@ -333,6 +336,19 @@ func decideFollower(d Decision, in Input, st waveState) Decision {
 	if !ok || tag == "" {
 		d.Blocker = &Blocker{Reason: ReasonWaitingForCandidate, Message: short(st.selRev)}
 		return d
+	}
+	// Same as Alongside: when the leader's bake of the selection failed or was
+	// cancelled the version drops out of the gate. A follower that already
+	// started it keeps going (the gate is an allow list).
+	for _, lm := range st.reg {
+		if lm.Site != st.leader {
+			continue
+		}
+		if bake, _, ok := bakeOf(lm, st.selRev); ok && (bake == BakeFailed || bake == BakeCancelled) {
+			d.Blocker = &Blocker{Reason: ReasonWaitingFor,
+				Message: env + "/" + st.leader + " bake " + strings.ToLower(bake) + " on " + short(st.selRev)}
+			return d
+		}
 	}
 	d.AllowedTags = []string{tag}
 	if p := in.Self.PinnedVersion; p != "" && p != tag {

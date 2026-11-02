@@ -95,6 +95,32 @@ type EnvironmentSpec struct {
 	// +required
 	Backend BackendConfig `json:"backend"`
 
+	// Site identifies where this instance of the environment runs (e.g. a region
+	// or cluster name such as "eu-west-1"). Members of the same environment that
+	// run in different clusters are told apart by site. When empty, the
+	// controller's default site is used (key "site" of the optional
+	// kuberik-cluster-info ConfigMap in the controller namespace). When neither is
+	// set, the Environment is site-less and behaves exactly as before sites existed.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$`
+	Site string `json:"site,omitempty"`
+
+	// Wave is the rollout wave of this site within its environment ("prod wave 1").
+	// Waves of one environment roll out in order: wave N starts a version only
+	// after every site of wave N-1 baked it. Defaults to 1 when a site is set.
+	// Ignored for site-less Environments.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Wave *int32 `json:"wave,omitempty"`
+
+	// Lockstep, when true, stops the wave-1 leader from selecting a new version
+	// until every wave of this environment has baked the currently selected one.
+	// The wave-1 leader's value governs; a disagreeing member surfaces a
+	// LockstepMismatch condition.
+	// +optional
+	Lockstep bool `json:"lockstep,omitempty"`
+
 	// RequeueInterval specifies how often the controller should reconcile this Environment
 	// If not specified, defaults to 1 minute. Must be a valid duration string (e.g., "1m", "30s", "5m").
 	// +optional
@@ -132,6 +158,57 @@ type EnvironmentInfo struct {
 	History []kuberikrolloutv1alpha1.DeploymentHistoryEntry `json:"history,omitempty"`
 }
 
+// WaveRole is the role a site plays inside its (environment, wave).
+type WaveRole string
+
+const (
+	// WaveRoleLeader selects the version for its wave.
+	WaveRoleLeader WaveRole = "Leader"
+	// WaveRoleFollower deploys whatever the leader of its wave selected.
+	WaveRoleFollower WaveRole = "Follower"
+)
+
+// WaveMemberStatus is one site of a wave as observed in the backend.
+type WaveMemberStatus struct {
+	// Environment of the member.
+	Environment string `json:"environment"`
+	// Site of the member.
+	Site string `json:"site"`
+	// Wave of the member.
+	Wave int32 `json:"wave"`
+	// Revision of the member's newest deployment.
+	// +optional
+	Revision string `json:"revision,omitempty"`
+	// BakeStatus of the member's newest deployment.
+	// +optional
+	BakeStatus string `json:"bakeStatus,omitempty"`
+	// Deregistered is true when the member was removed and no longer counts.
+	// +optional
+	Deregistered bool `json:"deregistered,omitempty"`
+}
+
+// WaveStatus describes the site/wave view the controller used for the last gate decision.
+type WaveStatus struct {
+	// Site is the effective site of this Environment (spec or controller default).
+	Site string `json:"site"`
+	// Wave is the effective wave of this Environment.
+	Wave int32 `json:"wave"`
+	// Role is Leader or Follower within (environment, wave). It is also the role
+	// recorded on the next GitHub deployment this site creates.
+	// +optional
+	Role WaveRole `json:"role,omitempty"`
+	// Leader is the site leading this (environment, wave).
+	// +optional
+	Leader string `json:"leader,omitempty"`
+	// SelectedRevision is the revision the leader of this wave currently selected.
+	// +optional
+	SelectedRevision string `json:"selectedRevision,omitempty"`
+	// Members are the registered sites of this environment and of its upstream environment.
+	// +listType=atomic
+	// +optional
+	Members []WaveMemberStatus `json:"members,omitempty"`
+}
+
 // EnvironmentStatus defines the observed state of Environment.
 type EnvironmentStatus struct {
 	// LastStatusChangeTime is the last time the status was updated (only updated when status changes)
@@ -151,6 +228,10 @@ type EnvironmentStatus struct {
 	// +listType=atomic
 	// +optional
 	EnvironmentInfos []EnvironmentInfo `json:"environmentInfos,omitempty"`
+
+	// Wave is set for Environments with a site and describes their wave state.
+	// +optional
+	Wave *WaveStatus `json:"wave,omitempty"`
 
 	// conditions represent the current state of the Environment resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.

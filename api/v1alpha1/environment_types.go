@@ -26,6 +26,30 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// RelationshipType is the type of the deprecated spec.relationship.
+// +kubebuilder:validation:Enum=After;Parallel;Alongside
+type RelationshipType string
+
+const (
+	// RelationshipTypeAfter is accepted for backward compatibility and ignored.
+	RelationshipTypeAfter RelationshipType = "After"
+	// RelationshipTypeParallel is accepted for backward compatibility and ignored.
+	RelationshipTypeParallel RelationshipType = "Parallel"
+	// RelationshipTypeAlongside is accepted for backward compatibility and ignored.
+	RelationshipTypeAlongside RelationshipType = "Alongside"
+)
+
+// EnvironmentRelationship is the deprecated relationship to another environment.
+type EnvironmentRelationship struct {
+	// Environment is the environment name this environment related to.
+	// +required
+	Environment string `json:"environment"`
+
+	// Type is the relationship type.
+	// +required
+	Type RelationshipType `json:"type"`
+}
+
 // BackendConfig contains backend-specific configuration
 type BackendConfig struct {
 	// Type specifies the backend to use (e.g., "github")
@@ -63,6 +87,13 @@ type EnvironmentSpec struct {
 	// +kubebuilder:validation:Enum=dev;development;test;qa;staging;stage;preprod;prod;production
 	Environment string `json:"environment"`
 
+	// Relationship is DEPRECATED and ignored: environment order is fixed
+	// (dev, test, staging, prod). It is still accepted so that existing
+	// manifests keep applying; the Environment reports a Deprecated condition.
+	// It will be removed in a later release.
+	// +optional
+	Relationship *EnvironmentRelationship `json:"relationship,omitempty"`
+
 	// Backend contains backend-specific configuration
 	// +required
 	Backend BackendConfig `json:"backend"`
@@ -71,8 +102,10 @@ type EnvironmentSpec struct {
 	// or cluster name such as "eu-west-1"). Members of the same environment that
 	// run in different clusters are told apart by site. When empty, the
 	// controller's default site is used (key "site" of the optional
-	// kuberik-cluster-info ConfigMap in the controller namespace). When neither is
-	// set, the Environment is site-less and behaves exactly as before sites existed.
+	// kuberik-cluster-info ConfigMap in the controller namespace), and when that
+	// is not set either, the site is "default". Only one Environment (across
+	// clusters) may own a given deployment name, tier and site; a second one is
+	// reported with WaveReady=False, reason DuplicateSite, and posts nothing.
 	// +optional
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$`
@@ -80,8 +113,7 @@ type EnvironmentSpec struct {
 
 	// Wave is the rollout wave of this site within its environment ("prod wave 1").
 	// Waves of one environment roll out in order: wave N starts a version only
-	// after every site of wave N-1 baked it. Defaults to 1 when a site is set.
-	// Ignored for site-less Environments.
+	// after every site of wave N-1 baked it. Defaults to 1.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	Wave *int32 `json:"wave,omitempty"`

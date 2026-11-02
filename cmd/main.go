@@ -86,7 +86,7 @@ func main() {
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.StringVar(&defaultSite, "default-site", os.Getenv("SITE"),
-		"The site used by Environments that do not set spec.site. Defaults to $SITE. Empty means site-less.")
+		"The site used by Environments that do not set spec.site. Defaults to $SITE. When empty the site is \"default\".")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{

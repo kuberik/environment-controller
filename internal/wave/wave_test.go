@@ -241,19 +241,6 @@ func TestDecide(t *testing.T) {
 			allowed: []string{}, checkAllowd: true,
 		},
 		{
-			name: "site-less upstream passthrough",
-			in: Input{Self: Self{Environment: "prod", Site: "a", Wave: 1, Upstream: "staging"}, Candidates: cands,
-				UpstreamSiteless: true, UpstreamBaked: []string{B, "unknown", A}},
-			role: RoleLeader, leader: "a", allowed: []string{"v1", "v2"}, checkAllowd: true,
-		},
-		{
-			name: "site-less upstream, nothing baked",
-			in: Input{Self: Self{Environment: "prod", Site: "a", Wave: 1, Upstream: "staging"}, Candidates: cands,
-				UpstreamSiteless: true},
-			role: RoleLeader, leader: "a", reason: ReasonWaitingFor, msg: "staging has no baked revision", checkMsg: true,
-			allowed: []string{}, checkAllowd: true,
-		},
-		{
 			name: "sited upstream: last wave only, newest first",
 			in: Input{Self: Self{Environment: "prod", Site: "a", Wave: 1, Upstream: "staging"}, Candidates: cands,
 				Members: []Member{
@@ -411,46 +398,6 @@ func TestMismatchMessage(t *testing.T) {
 	if got.Mismatch == nil || got.Mismatch.Message != want {
 		t.Fatalf("mismatch = %+v, want %q", got.Mismatch, want)
 	}
-}
-
-func TestUpstreamComplete(t *testing.T) {
-	ok := BakeSucceeded
-	t.Run("uses last wave only, newest first", func(t *testing.T) {
-		revs, b := UpstreamComplete("staging", []Member{
-			m("staging", "s1", 1, d(A, 1, ok, true), d(B, 2, BakeFailed, true)),
-			m("staging", "s2", 2, d(A, 3, ok, true), d(B, 5, ok, true)),
-			m("staging", "s3", 2, d(A, 4, ok, false), d(B, 6, ok, false)),
-			m("prod", "p", 1, d(C, 9, ok, true)),
-		})
-		if b != nil || !reflect.DeepEqual(revs, []string{B, A}) {
-			t.Fatalf("got %v %v", revs, b)
-		}
-	})
-	t.Run("gap", func(t *testing.T) {
-		revs, b := UpstreamComplete("staging", []Member{m("staging", "s1", 1), m("staging", "s4", 4)})
-		if revs != nil || b == nil || b.Reason != ReasonInvalidTopology || b.Message != "staging has waves 1,4 (missing 2,3)" {
-			t.Fatalf("got %v %+v", revs, b)
-		}
-	})
-	t.Run("deregistered ignored, empty env fine", func(t *testing.T) {
-		revs, b := UpstreamComplete("staging", []Member{
-			m("staging", "s1", 1, d(A, 1, ok, true)),
-			dereg(m("staging", "s2", 2, d(A, 2, BakeFailed, false)))})
-		if b != nil || !reflect.DeepEqual(revs, []string{A}) {
-			t.Fatalf("got %v %v", revs, b)
-		}
-		revs, b = UpstreamComplete("staging", nil)
-		if b != nil || len(revs) != 0 {
-			t.Fatalf("got %v %v", revs, b)
-		}
-	})
-	t.Run("missing status not done", func(t *testing.T) {
-		revs, _ := UpstreamComplete("staging", []Member{
-			m("staging", "s1", 1, d(A, 1, ok, true)), m("staging", "s2", 1, d(A, 2, "", false))})
-		if len(revs) != 0 {
-			t.Fatalf("got %v", revs)
-		}
-	})
 }
 
 func TestNewestDeploymentOfRevisionDecidesBake(t *testing.T) {

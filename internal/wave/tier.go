@@ -16,14 +16,28 @@ limitations under the License.
 
 package wave
 
+// Canonical tier names and aliases.
+const (
+	TierDev     = "dev"
+	TierTest    = "test"
+	TierStaging = "staging"
+	TierProd    = "prod"
+
+	aliasDevelopment = "development"
+	aliasQA          = "qa"
+	aliasStage       = "stage"
+	aliasPreprod     = "preprod"
+	aliasProduction  = "production"
+)
+
 // Environments are ordered by fixed tiers, earliest first. Every tier accepts
 // a few aliases; the first name is canonical. Aliases are the same environment
 // everywhere: wave grouping, upstream lookup and GitHub matching.
 var tiers = [][]string{
-	{"dev", "development"},
-	{"test", "qa"},
-	{"staging", "stage", "preprod"},
-	{"prod", "production"},
+	{TierDev, aliasDevelopment},
+	{TierTest, aliasQA},
+	{TierStaging, aliasStage, aliasPreprod},
+	{TierProd, aliasProduction},
 }
 
 // Canonical returns the canonical tier name of an environment name and whether

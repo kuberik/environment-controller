@@ -50,7 +50,7 @@ limitations under the License.
 //     only eligible to lead when no other registered member exists in its wave:
 //     the other members cannot see it yet, so it must not out-rank them.
 //  4. If no selection record exists at all in (env, wave) (fresh fleet, or a
-//     fleet migrating from site-less), the computed leader's newest deployment
+//     fleet migrating from legacy deployments), the computed leader's newest deployment
 //     acts as the implicit selection, so followers have something to follow. In
 //     waves N>1 the implicit selection only counts when wave N-1 completed it.
 //
@@ -60,8 +60,8 @@ limitations under the License.
 // Allowed versions
 //
 //   - Wave-1 leader: revisions that fully completed the upstream environment
-//     (baked Succeeded by every registered member of the upstream's LAST wave; a
-//     site-less upstream passes UpstreamBaked through). No upstream: unrestricted.
+//     (baked Succeeded by every registered member of the upstream's LAST wave).
+//     No upstream: unrestricted.
 //   - Wave-N leader (N>1): revisions baked Succeeded by EVERY registered member of
 //     wave N-1 of the same environment.
 //   - Follower (any wave): exactly the current selection of its wave. Followers do
@@ -88,7 +88,6 @@ limitations under the License.
 package wave
 
 import (
-	"sort"
 	"strings"
 )
 
@@ -182,11 +181,6 @@ type Input struct {
 	// (Self.Environment, Self.Wave) and overrides any recorded Wave/Lockstep for
 	// Self with the spec values.
 	Members []Member
-	// UpstreamSiteless is true when the upstream environment has no registered
-	// sited members; UpstreamBaked then carries the revisions it baked
-	// Succeeded (today's single-stream logic).
-	UpstreamSiteless bool
-	UpstreamBaked    []string
 	// Candidates maps revision -> tag from the local Rollout's releaseCandidates
 	// plus the release the site runs now (so an up-to-date site maps too).
 	Candidates map[string]string
@@ -256,8 +250,7 @@ func Decide(in Input) Decision {
 			Message: s.Environment + " is its own upstream"})
 	}
 	hasUpstream := s.Upstream != ""
-	sitedUpstream := hasUpstream && !in.UpstreamSiteless
-	if sitedUpstream {
+	if hasUpstream {
 		up = newFleet(s.Upstream, in.Members, nil, false)
 		if b := up.topology(); b != nil {
 			return blocked(d, b)
@@ -289,11 +282,6 @@ func Decide(in Input) Decision {
 	case !hasUpstream:
 		d.Unrestricted = true
 		return d
-	case in.UpstreamSiteless:
-		revs = map[string]int64{}
-		for _, r := range in.UpstreamBaked {
-			revs[r] = 0
-		}
 	default:
 		prevEnv = s.Upstream
 		prev = up.state(up.lastWave())
@@ -302,12 +290,7 @@ func Decide(in Input) Decision {
 
 	d.AllowedTags = tagList(revs, in.Candidates)
 	if len(d.AllowedTags) == 0 {
-		if in.UpstreamSiteless && s.Wave == 1 {
-			// DECISION: nothing baked upstream yet; there is no member to name.
-			d.Blocker = &Blocker{Reason: ReasonWaitingFor, Message: s.Upstream + " has no baked revision"}
-		} else {
-			d.Blocker = prev.blocker(prevEnv)
-		}
+		d.Blocker = prev.blocker(prevEnv)
 	} else if _, done := revs[prev.selRev]; prev.selRev != "" && !done &&
 		in.Current != "" && d.AllowedTags[0] == in.Candidates[in.Current] {
 		// The newest allowed release is the one this site already runs, and
@@ -355,28 +338,4 @@ func decideFollower(d Decision, in Input, st waveState) Decision {
 		d.Blocker = &Blocker{Reason: ReasonPinned, Message: "pinned to " + p + ", wave selected " + tag}
 	}
 	return d
-}
-
-// UpstreamComplete returns the revisions that fully completed the given sited
-// environment: baked Succeeded by every registered member of its last wave. It
-// returns a Blocker (InvalidTopology) when the environment's waves have a gap.
-// Used directly by site-less Environments whose upstream is sited.
-// Revisions are ordered newest first (ties by revision).
-func UpstreamComplete(env string, members []Member) ([]string, *Blocker) {
-	f := newFleet(env, members, nil, false)
-	if b := f.topology(); b != nil {
-		return nil, b
-	}
-	revs := completedRevs(f.state(f.lastWave()).reg)
-	out := make([]string, 0, len(revs))
-	for r := range revs {
-		out = append(out, r)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if revs[out[i]] != revs[out[j]] {
-			return revs[out[i]] > revs[out[j]]
-		}
-		return out[i] < out[j]
-	})
-	return out, nil
 }

@@ -245,31 +245,7 @@ func (f fleet) state(w int32) waveState {
 		return st
 	}
 	var selSite string
-	var selOrder int64
-	for _, m := range all {
-		for _, d := range m.Deployments {
-			if !d.Selection || d.Wave != w {
-				continue
-			}
-			if !st.explicit || d.Order > selOrder || (d.Order == selOrder && m.Site < selSite) {
-				st.explicit, selOrder, st.selRev, selSite = true, d.Order, d.Revision, m.Site
-			}
-		}
-	}
-	// Selection records written in this wave by members that have since moved
-	// to another wave still count (deregistered members' records count too).
-	for ow, ms := range f.byWave {
-		if ow == w {
-			continue
-		}
-		for _, m := range ms {
-			for _, d := range m.Deployments {
-				if d.Selection && d.Wave == w && (!st.explicit || d.Order > selOrder || (d.Order == selOrder && m.Site < selSite)) {
-					st.explicit, selOrder, st.selRev, selSite = true, d.Order, d.Revision, m.Site
-				}
-			}
-		}
-	}
+	st.selRev, selSite, st.explicit = f.selection(w)
 	st.leader = st.reg[0].Site
 	if st.reg[0].Site == f.unseenSelf && len(st.reg) > 1 {
 		st.leader = st.reg[1].Site
@@ -285,6 +261,34 @@ func (f fleet) state(w int32) waveState {
 	// Implicit selection: the computed leader's newest deployment. In waves
 	// after the first it only counts once the previous wave completed it, so
 	// a migration cannot leak an ungated revision into a later wave.
+	st.selRev = f.implicitSelection(w, st)
+	return st
+}
+
+// selection returns the newest selection record written in wave w by any
+// member (moved or deregistered members included). Ties on Order go to the
+// lower site.
+func (f fleet) selection(w int32) (rev, site string, ok bool) {
+	var order int64
+	for _, ms := range f.byWave {
+		for _, m := range ms {
+			for _, d := range m.Deployments {
+				if !d.Selection || d.Wave != w {
+					continue
+				}
+				if !ok || d.Order > order || (d.Order == order && m.Site < site) {
+					ok, order, rev, site = true, d.Order, d.Revision, m.Site
+				}
+			}
+		}
+	}
+	return rev, site, ok
+}
+
+// implicitSelection is the computed leader's newest deployment. In waves after
+// the first it only counts once the previous wave completed it, so a migration
+// cannot leak an ungated revision into a later wave.
+func (f fleet) implicitSelection(w int32, st waveState) string {
 	var newest Deployment
 	found := false
 	for _, m := range st.reg {
@@ -297,15 +301,15 @@ func (f fleet) state(w int32) waveState {
 			}
 		}
 	}
-	if found && w > 1 {
+	if !found {
+		return ""
+	}
+	if w > 1 {
 		if _, done := completedRevs(f.state(w - 1).reg)[newest.Revision]; !done {
-			found = false
+			return ""
 		}
 	}
-	if found {
-		st.selRev = newest.Revision
-	}
-	return st
+	return newest.Revision
 }
 
 // blocker names the first registered member (by site) that has not baked the

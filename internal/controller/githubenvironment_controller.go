@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -34,9 +35,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	k8sptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -82,12 +85,22 @@ type deploymentPayload struct {
 	ID           string                                   `json:"id"`                     // History entry ID (immutable)
 	Relationship *kuberikv1alpha1.EnvironmentRelationship `json:"relationship,omitempty"` // Relationship for this environment
 	Version      *kuberikrolloutv1alpha1.VersionInfo      `json:"version,omitempty"`      // Version information (immutable)
+
+	// Sites and waves. All omitempty so a site-less payload is byte-identical to
+	// what was written before sites existed.
+	Site      string `json:"site,omitempty"`      // Effective site that created the deployment
+	Wave      int32  `json:"wave,omitempty"`      // Effective wave of the site at creation
+	Lockstep  bool   `json:"lockstep,omitempty"`  // Lockstep flag of the site at creation
+	Selection bool   `json:"selection,omitempty"` // Written by the wave leader (selection record)
 }
 
 // deploymentKey represents a unique key for mapping deployments by ID and environment
 type deploymentKey struct {
 	ID          string
 	Environment string
+	// Site is the payload site; Rollout history IDs are per-cluster sequences,
+	// so two sites collide on ID. "" for site-less deployments.
+	Site string
 }
 
 // GitHubEnvironmentReconciler reconciles an Environment object for GitHub backend
@@ -95,6 +108,18 @@ type GitHubEnvironmentReconciler struct {
 	client.Client
 	Scheme         *runtime.Scheme
 	CacheTransport http.RoundTripper
+
+	// DefaultSite is the site used by Environments that do not set spec.site
+	// (cmd/main.go fills it from --default-site / $SITE). Empty means such
+	// Environments are site-less.
+	DefaultSite string
+
+	// GitHubBaseURL overrides the GitHub API base URL (tests point it at a fake
+	// server). Empty means api.github.com.
+	GitHubBaseURL string
+
+	// Recorder emits events (optional; nil disables events).
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=environments.kuberik.com,resources=environments,verbs=get;list;watch;create;update;patch;delete
@@ -107,6 +132,8 @@ type GitHubEnvironmentReconciler struct {
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -121,6 +148,23 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			logger.Error(err, "Failed to get Environment")
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Deletion: post the deregistration marker, then release the finalizer.
+	if !deployment.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, deployment)
+	}
+
+	// One status fetch per GitHub deployment per reconcile (see readMembers).
+	ctx = withReconcileCache(ctx)
+
+	// Sited Environments carry the deregistration finalizer.
+	site := r.effectiveSite(deployment)
+	if site != "" && !controllerutil.ContainsFinalizer(deployment, DeregisterFinalizer) {
+		controllerutil.AddFinalizer(deployment, DeregisterFinalizer)
+		if err := r.Update(ctx, deployment); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Validate backend
@@ -139,6 +183,12 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	githubClient, err := r.getGitHubClient(ctx, deployment)
 	if err != nil {
 		logger.Error(err, "Failed to get GitHub client")
+		return ctrl.Result{}, err
+	}
+
+	// Site changes and removal (deregister the old site, drop wave status)
+	if err := r.reconcileSiteChange(ctx, githubClient, deployment); err != nil {
+		log.Error(err, "Failed to reconcile site change")
 		return ctrl.Result{}, err
 	}
 
@@ -167,8 +217,15 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
-	// Update allowed versions on RolloutGate based on relationships
-	if err := r.updateAllowedVersionsFromRelationships(ctx, deployment); err != nil {
+	// Update allowed versions on RolloutGate. Sited: wave.Decide (status.wave and
+	// conditions are written before the gate). Site-less: relationship logic, via
+	// wave.UpstreamComplete only when the upstream environment is sited.
+	if site != "" {
+		if err := r.reconcileWave(ctx, githubClient, deployment, rollout); err != nil {
+			logger.Error(err, "Failed to reconcile wave")
+			return ctrl.Result{}, err
+		}
+	} else if err := r.updateAllowedVersions(ctx, githubClient, deployment, rollout); err != nil {
 		logger.Error(err, "Failed to update allowed versions from relationships")
 		return ctrl.Result{}, err
 	}
@@ -276,11 +333,25 @@ func (r *GitHubEnvironmentReconciler) getGitHubClient(ctx context.Context, deplo
 	}
 
 	// Create GitHub client with OAuth2 authentication and caching
-	return github.NewClient(httpClient).WithAuthToken(string(token)), nil
+	gh := github.NewClient(httpClient).WithAuthToken(string(token))
+	if r.GitHubBaseURL != "" {
+		u, err := url.Parse(strings.TrimSuffix(r.GitHubBaseURL, "/") + "/")
+		if err != nil {
+			return nil, fmt.Errorf("invalid GitHub base URL %q: %w", r.GitHubBaseURL, err)
+		}
+		gh.BaseURL = u
+	}
+	return gh, nil
 }
 
 // createDeploymentStatus creates a GitHub deployment status for the given environment
 func (r *GitHubEnvironmentReconciler) createDeploymentStatus(ctx context.Context, ghClient *github.Client, environment *kuberikv1alpha1.Environment, deploymentID int64, state string, description string) error {
+	return r.createDeploymentStatusWithURL(ctx, ghClient, environment, deploymentID, state, description, true)
+}
+
+// createDeploymentStatusWithURL is createDeploymentStatus with control over the
+// environment_url lookup (the deregistration marker does not need it).
+func (r *GitHubEnvironmentReconciler) createDeploymentStatusWithURL(ctx context.Context, ghClient *github.Client, environment *kuberikv1alpha1.Environment, deploymentID int64, state string, description string, withURL bool) error {
 	owner, repo, err := parseProject(environment.Spec.Backend.Project)
 	if err != nil {
 		return err
@@ -293,7 +364,10 @@ func (r *GitHubEnvironmentReconciler) createDeploymentStatus(ctx context.Context
 
 	// Get rollout-dashboard URL from ingress/gateway in controller's namespace
 	// The URL will include the path /rollouts/<namespace>/<name>
-	environmentURL := r.getRolloutDashboardURL(ctx, environment.Namespace, environment.Name)
+	environmentURL := ""
+	if withURL {
+		environmentURL = r.getRolloutDashboardURL(ctx, environment.Namespace, environment.Name)
+	}
 
 	// Create deployment status request
 	statusRequest := &github.DeploymentStatusRequest{
@@ -304,6 +378,16 @@ func (r *GitHubEnvironmentReconciler) createDeploymentStatus(ctx context.Context
 	if environmentURL != "" {
 		statusRequest.EnvironmentURL = github.String(environmentURL)
 	}
+
+	// Sited deployments share one GitHub environment across sites. With GitHub's
+	// default auto_inactive a success on one site would mark every other site's
+	// deployment inactive, so it is switched off for them.
+	if r.effectiveSite(environment) != "" {
+		statusRequest.AutoInactive = github.Bool(false)
+	}
+
+	// The cached statuses of this deployment are stale from here on.
+	reconcileCacheFrom(ctx).invalidate(deploymentID)
 
 	// Create the deployment status
 	_, _, createErr := ghClient.Repositories.CreateDeploymentStatus(ctx, owner, repo, deploymentID, statusRequest)
@@ -819,6 +903,7 @@ func (r *GitHubEnvironmentReconciler) extractDeploymentKey(dep *github.Deploymen
 	return &deploymentKey{
 		ID:          payload.ID,
 		Environment: *dep.Environment,
+		Site:        payload.Site,
 	}
 }
 
@@ -835,6 +920,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 	deploymentName := ensureKuberikPrefix(environment.Spec.Name)
 	formattedEnv := formatDeploymentEnvironment(deploymentName, environment.Spec.Environment)
 	task := formatDeploymentTask(deploymentName)
+	site := r.effectiveSite(environment)
 
 	// Map deployments by ID + environment from payload
 	// We'll query deployments per history entry using ref + environment for more targeted queries
@@ -858,6 +944,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 		key := deploymentKey{
 			ID:          historyID,
 			Environment: formattedEnv,
+			Site:        site,
 		}
 
 		// Check if we already found this deployment in a previous iteration
@@ -883,7 +970,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 
 				// Try to extract key from list response first (faster)
 				existingKey := r.extractDeploymentKey(d)
-				if existingKey != nil && existingKey.ID == historyID {
+				if existingKey != nil && existingKey.ID == historyID && existingKey.Site == site {
 					dep = d
 					keyToDeployment[key] = dep
 					break
@@ -895,7 +982,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 					continue
 				}
 				existingKey = r.extractDeploymentKey(fullDeployment)
-				if existingKey != nil && existingKey.ID == historyID {
+				if existingKey != nil && existingKey.ID == historyID && existingKey.Site == site {
 					dep = fullDeployment
 					keyToDeployment[key] = dep
 					break
@@ -911,6 +998,12 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 				ID:           historyID,
 				Relationship: normalizeRelationship(environment.Spec.Relationship),
 				Version:      h.Version.DeepCopy(),
+			}
+			if site != "" {
+				payload.Site = site
+				payload.Wave = r.effectiveWave(environment)
+				payload.Lockstep = environment.Spec.Lockstep
+				payload.Selection = isWaveLeader(environment, site)
 			}
 			payloadJSON, err := json.Marshal(payload)
 			if err != nil {
@@ -955,7 +1048,9 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 		// This prevents duplicate statuses like: pending -> success -> pending
 		statuses, _, err := gh.Repositories.ListDeploymentStatuses(ctx, owner, repo, dep.GetID(), &github.ListOptions{})
 		statusExists := false
-		if err == nil && len(statuses) > 0 {
+		if err == nil && len(statuses) > 0 && !isDeregisteredStatus(statuses[0]) {
+			// A Deregistered marker as newest status means the site left and is
+			// registering again: the exact-status de-dup must not apply.
 			// Statuses are ordered newest first, so the first one is the latest
 			for _, status := range statuses {
 				if status.State != nil && *status.State == ghState && status.Description != nil && *status.Description == ghDesc {
@@ -1195,6 +1290,10 @@ func (r *GitHubEnvironmentReconciler) processDeploymentForHistory(ctx context.Co
 // fetchAllDeploymentStatuses fetches all deployment statuses with pagination
 // entryID and envName are optional parameters used for logging errors
 func (r *GitHubEnvironmentReconciler) fetchAllDeploymentStatuses(ctx context.Context, ghClient *github.Client, owner, repo string, deploymentID int64) ([]*github.DeploymentStatus, error) {
+	cache := reconcileCacheFrom(ctx)
+	if cached, ok := cache.get(deploymentID); ok {
+		return cached, nil
+	}
 	allStatuses := make([]*github.DeploymentStatus, 0)
 	statusOpts := &github.ListOptions{PerPage: 100}
 	for {
@@ -1208,6 +1307,7 @@ func (r *GitHubEnvironmentReconciler) fetchAllDeploymentStatuses(ctx context.Con
 		}
 		statusOpts.Page = resp.NextPage
 	}
+	cache.put(deploymentID, allStatuses)
 	return allStatuses, nil
 }
 
@@ -1470,6 +1570,13 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 		}
 	}
 
+	// Rollout history IDs are per-cluster sequences: never merge sites in the
+	// displayed history. Each environment shows one site (see displayDeployments).
+	ownSites := r.ownSitesByEnv(environment, environmentList)
+	for envName, deps := range envDeployments {
+		envDeployments[envName] = r.displayDeployments(envName, deps, ownSites)
+	}
+
 	// Build set of relevant environments based on relationships
 	// Start with current environment and traverse relationships
 	visited := make(map[string]bool)
@@ -1621,6 +1728,7 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 				}
 				opts.Page = resp.NextPage
 			}
+			allDeploymentsForEnv = r.displayDeployments(envName, allDeploymentsForEnv, ownSites)
 			envDeployments[envName] = allDeploymentsForEnv
 
 			if len(allDeploymentsForEnv) == 0 {

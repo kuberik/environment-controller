@@ -53,7 +53,6 @@ const (
 	// backendTypeGitHub is the Environment backend type handled by this controller
 	backendTypeGitHub = "github"
 
-
 	// defaultSecretName is the GitHub token Secret used when Backend.Secret is unset.
 	defaultSecretName = "github-token"
 	// productionEnvironment is the environment that is reported to GitHub as a production environment

@@ -100,7 +100,7 @@ func (f fleet) topology() *Blocker {
 	}
 	var missing []string
 	have := map[int32]bool{}
-	var names []string
+	names := make([]string, 0, len(ws))
 	for _, w := range ws {
 		have[w] = true
 		names = append(names, strconv.Itoa(int(w)))

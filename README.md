@@ -107,7 +107,7 @@ One logical environment (`prod`) can run in several clusters. Each cluster's ins
 
 The effective site is `spec.site`, else the controller's default site (flag `--default-site`, which defaults to `$SITE`; the manager Deployment fills `SITE` from the optional ConfigMap `kuberik-cluster-info`, key `site`, the same ConfigMap rollout-dashboard reads), else the literal `default`. The effective wave is `spec.wave`, else 1. Every Environment is therefore sited: it always carries the deregister finalizer, `status.wave` and the wave conditions.
 
-Deployments in GitHub written before sites existed have no site in their payload. They count as site `default`, wave 1, so a single-cluster setup continues its history. A cluster whose default site is not `default` (for example `SITE=eu-west-1`) does not match those legacy deployments and starts a fresh history under its own site.
+Deployments in GitHub written before sites existed have no site in their payload. They count as site `default`, wave 1, so a single-cluster setup continues its history. Those legacy deployments stay a live member `default` of their tier until a marker deregisters it. An Environment that was reconciled as `default` and then moves to another site (spec.site, or the cluster default site plus a controller restart) deregisters `default` itself. If the upgraded controller starts with a non-`default` site straight away (for example `SITE=eu-west-1` already set), nothing deregisters `default`: it stays a phantom wave-1 member that leads the wave and never bakes new versions, so the next tier stalls. Upgrade with the site unset first, let every Environment reconcile once, then set the site.
 
 ### Leader rule
 
@@ -174,7 +174,9 @@ Bypass when GitHub is unreachable or the cluster is dying:
 kubectl annotate environment X environments.kuberik.com/skip-deregister=true
 ```
 
-To replace an owner that can no longer deregister (rebuilt cluster, skip-deregister used), annotate the new Environment `environments.kuberik.com/take-over-site=true`: it posts a deregistration marker on each conflicting owner and registers as the owner.
+To replace an owner that can no longer deregister (rebuilt cluster, skip-deregister used), annotate the new Environment `environments.kuberik.com/take-over-site=true`: it posts a deregistration marker on each conflicting owner and registers as the owner. Remove the annotation afterwards; while it is set, any later conflict is resolved by another takeover.
+
+Legacy deployments carry no owner, so an upgraded Environment has no ownership claim until it creates its first new deployment (its next rollout). A second Environment for the same name, tier and site that appears in that window is not blocked: it adopts the legacy history and claims the site, and the original becomes `DuplicateSite`. Do not register duplicates during the upgrade; `take-over-site` repairs it.
 
 The controller also gives up (event plus finalizer removal) when the namespace is terminating and the token Secret is gone. If the controller itself is down:
 
@@ -252,7 +254,7 @@ data:
 2. Rename non-standard `spec.environment` values to one of the nine accepted names (`dev`, `development`, `test`, `qa`, `staging`, `stage`, `preprod`, `prod`, `production`). Objects outside that set fail validation on their next update; they keep running until then.
 3. Optionally set `spec.site` and `spec.wave` (or provide the site once per cluster through the `site` key of the `kuberik-cluster-info` ConfigMap).
 4. Remove `spec.relationship` at your leisure. It is accepted and ignored (condition `Deprecated=True`, reason `RelationshipIgnored`) and will be removed in a later release.
-5. GitHub history continues: deployments without a site count as site `default`, wave 1. This holds as long as the Environment's effective site is `default`; if you set another site or the cluster's default site differs, a fresh history starts under that site.
+5. GitHub history continues: deployments without a site count as site `default`, wave 1. Keep the effective site `default` for the first reconcile after the upgrade (do not set the ConfigMap `site` before upgrading). Setting a site afterwards deregisters `default`, and the Environment continues under its new site.
 
 What changes after the upgrade: every Environment gets the `environments.kuberik.com/deregister` finalizer and `status.wave`, and new deployment payloads carry `site`, `wave` and `owner`.
 

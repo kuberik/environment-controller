@@ -61,6 +61,7 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	var defaultSite string
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -84,6 +85,8 @@ func main() {
 		"The directory that contains the metrics server certificate.")
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
+	flag.StringVar(&defaultSite, "default-site", os.Getenv("SITE"),
+		"The site used by Environments that do not set spec.site. Defaults to $SITE. Empty means site-less.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
@@ -194,6 +197,8 @@ func main() {
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
 		CacheTransport: cacheTransport,
+		DefaultSite:    defaultSite,
+		Recorder:       mgr.GetEventRecorderFor("environment-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Environment")
 		os.Exit(1)

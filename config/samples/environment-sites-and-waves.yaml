@@ -1,0 +1,65 @@
+# One application ("prod") deployed to three clusters. Each Environment below
+# lives in its OWN cluster; they are shown together for reading. Sites are told
+# apart in GitHub by payload metadata, the GitHub environment name is the same.
+#
+# Wave 1: eu-west-1 and us-east-1 (the lexicographically lowest, eu-west-1, leads).
+# Wave 2: ap-south-1 starts a version only after BOTH wave-1 sites baked it.
+apiVersion: environments.kuberik.com/v1alpha1
+kind: Environment
+metadata:
+  name: myapp-prod-eu-west-1
+  namespace: default
+spec:
+  rolloutRef:
+    name: myapp-rollout
+  name: myapp
+  environment: prod
+  site: eu-west-1
+  wave: 1
+  relationship:
+    type: After
+    environment: staging
+  backend:
+    type: github
+    project: myorg/myapp
+    secret: github-token
+---
+apiVersion: environments.kuberik.com/v1alpha1
+kind: Environment
+metadata:
+  name: myapp-prod-us-east-1
+  namespace: default
+spec:
+  rolloutRef:
+    name: myapp-rollout
+  name: myapp
+  environment: prod
+  site: us-east-1
+  wave: 1
+  relationship:
+    type: After
+    environment: staging
+  backend:
+    type: github
+    project: myorg/myapp
+    secret: github-token
+---
+apiVersion: environments.kuberik.com/v1alpha1
+kind: Environment
+metadata:
+  name: myapp-prod-ap-south-1
+  namespace: default
+spec:
+  rolloutRef:
+    name: myapp-rollout
+  name: myapp
+  environment: prod
+  site: ap-south-1
+  wave: 2
+  relationship:
+    type: After
+    environment: staging
+  backend:
+    type: github
+    project: myorg/myapp
+    secret: github-token

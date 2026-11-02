@@ -3,3 +3,4 @@ kind: Kustomization
 resources:
 - environment-sample.yaml
 - kuberik_v1alpha1_environment.yaml
+- environment-sites-and-waves.yaml

@@ -79,6 +79,81 @@ spec:
   - `environment`: Environment name this deployment relates to
 - `requeueInterval`: Interval for reconciliation (default: "1m")
 
+## Sites and waves
+
+One logical environment (`prod`) can run in several clusters. Each cluster's instance is a **site**; sites of one environment roll out in ordered **waves**. All coordination happens through GitHub deployments, so clusters never talk to each other.
+
+### Fields
+
+| Field | Meaning |
+| --- | --- |
+| `spec.site` | Name of this cluster's instance (`eu-west-1`). Max 63 chars, `[A-Za-z0-9._-]`. |
+| `spec.wave` | 1-based wave of this site inside its environment. Defaults to 1 when a site is set. |
+| `spec.lockstep` | If true on the wave-1 leader, no new version is selected until every wave baked the current one. |
+
+If `spec.site` is empty the controller uses its default site: flag `--default-site`, which defaults to `$SITE`. The manager Deployment fills `SITE` from the optional ConfigMap `kuberik-cluster-info`, key `site` (the same ConfigMap rollout-dashboard reads). With neither set an Environment is **site-less** and behaves exactly as before: same GitHub names, same payloads, no finalizer, no new conditions or status.
+
+### Leader rule
+
+Within `(environment, wave)` one site is the **leader** and writes the *selection record*: a GitHub deployment whose payload has `selection: true`. The leader is the lexicographically lowest registered site, but it is sticky while a selection is in flight: a lower-sorting site registering mid-rollout does not take over. Followers deploy exactly the newest selection record of their wave and do not wait for the leader's bake.
+
+### Allowed versions
+
+- Wave-1 leader: versions that completed the upstream environment (`relationship`): baked successfully by every registered member of the upstream's last wave. No upstream: unrestricted (the gate's `allowedVersions` is unset).
+- Wave-N leader (N>1): versions baked successfully by every registered member of wave N-1.
+- Follower: exactly the current selection of its wave.
+- A site-less Environment with a sited upstream uses the upstream's last wave as above.
+- Revisions are mapped to tags via the Rollout's `releaseCandidates`; a revision without a tag is dropped.
+- The waves of an environment must be exactly `1..max`; a gap blocks everything.
+
+### Lockstep
+
+When the wave-1 leader sets `lockstep: true`, its allowed set is pinned to the current selection until every registered member of every wave baked it successfully. Members that disagree with the leader's value surface `LockstepConsistent=False`; the leader's value governs.
+
+### Status and conditions
+
+`status.wave` records site, wave, role (`Leader`/`Follower`), leader, selected revision and the observed members. It is written before the RolloutGate is updated. Only sited Environments get these conditions:
+
+| Condition | Status / Reason | Meaning |
+| --- | --- | --- |
+| `WaveReady` | `True` / `Ready` | The site may deploy the allowed versions. |
+| `WaveReady` | `False` / `WaitingFor` | Waiting for a named member to bake (message names it). |
+| `WaveReady` | `False` / `WaitingForCandidate` | The wanted revision has no release-candidate tag yet. |
+| `WaveReady` | `False` / `Pinned` | The Rollout pins `spec.wantedVersion`. |
+| `WaveReady` | `False` / `InvalidTopology` | Waves have a gap (this or the upstream environment). |
+| `WaveReady` | `False` / `LockstepWaiting` | Lockstep holds the leader on the current selection. |
+| `LockstepConsistent` | `False` / `LockstepMismatch` | A member disagrees with the leader's `lockstep`. |
+
+### GitHub encoding
+
+The GitHub environment stays `kuberik/<name>/<environment>` and the task `deploy:kuberik/<name>` for every site. The deployment payload gains `site`, `wave`, `lockstep` and `selection` (all omitted when empty). Deployments are matched by (history ID, environment, site), because Rollout history IDs are per-cluster sequences. Statuses of sited deployments are posted with `auto_inactive: false` so one site's success does not deactivate another's. Per reconcile the controller lists at most 10 pages of 100 deployments per environment (self and upstream), keeps the newest 20 per site and fetches each of their statuses once.
+
+### Deletion
+
+Sited Environments carry the finalizer `environments.kuberik.com/deregister`. On delete the controller posts an `inactive` status `Deregistered: site <site> removed` on the site's newest deployment and removes the finalizer. A deregistered site no longer counts for membership, leadership or completion; its past selection records still do. Changing a site deregisters the old name first; re-registering the same site simply posts fresh statuses.
+
+Bypass when GitHub is unreachable or the cluster is dying:
+
+```bash
+kubectl annotate environment X environments.kuberik.com/skip-deregister=true
+```
+
+The controller also gives up (event plus finalizer removal) when the namespace is terminating and the token Secret is gone. If the controller itself is down:
+
+```bash
+kubectl patch environment X --type=merge -p '{"metadata":{"finalizers":null}}'
+```
+
+A deregistered-by-hand site from a dead cluster stays registered until someone posts the marker; a CLI for that is a follow-up.
+
+### Follow-ups
+
+- CLI to deregister dead clusters.
+- Helm chart wiring of `SITE` / the `kuberik-cluster-info` ConfigMap.
+- Dashboard UI for sites, waves and the conditions above.
+
+See `config/samples/environment-sites-and-waves.yaml` for a three-site example.
+
 ## GitHub Token Secret
 
 The controller requires a GitHub token to authenticate with the GitHub API. Create a secret with the token:

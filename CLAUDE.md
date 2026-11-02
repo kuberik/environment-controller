@@ -98,6 +98,11 @@ spec:
     type: "github"
     project: "myorg/myapp"
     secret: "github-token"
+
+  # Optional sites and waves (see README "Sites and waves"). Omit for site-less.
+  # site: eu-west-1   # defaults to the controller's --default-site / $SITE
+  # wave: 1           # defaults to 1 when a site is set
+  # lockstep: false
 ```
 
 ## GitHub Backend Integration

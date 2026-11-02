@@ -1,5 +1,7 @@
+# Standalone example, not part of config/samples/kustomization.yaml.
 # One application ("prod") deployed to three clusters. Each Environment below
-# lives in its OWN cluster; they are shown together for reading. Sites are told
+# goes to its OWN cluster (apply each document only there); they are shown
+# together for reading. Sites are told
 # apart in GitHub by payload metadata, the GitHub environment name is the same.
 #
 # Wave 1: eu-west-1 and us-east-1 (the lexicographically lowest, eu-west-1, leads).

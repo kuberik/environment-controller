@@ -97,6 +97,8 @@ If `spec.site` is empty the controller uses its default site: flag `--default-si
 
 Within `(environment, wave)` one site is the **leader** and writes the *selection record*: a GitHub deployment whose payload has `selection: true`. The leader is the lexicographically lowest registered site, but it is sticky while a selection is in flight: a lower-sorting site registering mid-rollout does not take over. Followers deploy exactly the newest selection record of their wave and do not wait for the leader's bake.
 
+The `selection` flag on a deployment records the role from the *previous* gate decision (`status.wave.role`), because the deployment is written after the Rollout already acted on the gate. A leader's very first deployment therefore carries no flag yet; it acts as an implicit selection until the next reconcile records `Leader`, after which new deployments are flagged.
+
 ### Allowed versions
 
 - Wave-1 leader: versions that completed the upstream environment (`relationship`): baked successfully by every registered member of the upstream's last wave. No upstream: unrestricted (the gate's `allowedVersions` is unset).
@@ -126,11 +128,15 @@ When the wave-1 leader sets `lockstep: true`, its allowed set is pinned to the c
 
 ### GitHub encoding
 
-The GitHub environment stays `kuberik/<name>/<environment>` and the task `deploy:kuberik/<name>` for every site. The deployment payload gains `site`, `wave`, `lockstep` and `selection` (all omitted when empty). Deployments are matched by (history ID, environment, site), because Rollout history IDs are per-cluster sequences. Statuses of sited deployments are posted with `auto_inactive: false` so one site's success does not deactivate another's. Per reconcile the controller lists at most 10 pages of 100 deployments per environment (self and upstream), keeps the newest 20 per site and fetches each of their statuses once.
+The GitHub environment stays `kuberik/<name>/<environment>` and the task `deploy:kuberik/<name>` for every site. The deployment payload gains `site`, `wave`, `lockstep` and `selection` (all omitted when empty). Deployments are matched by (history ID, environment, site), because Rollout history IDs are per-cluster sequences. Statuses of sited deployments are posted with `auto_inactive: false` so one site's success does not deactivate another's. Per reconcile the controller lists at most 10 pages of 100 deployments per environment (self and upstream), keeps the newest 20 per site and fetches each of their statuses once (see "GitHub call budget").
 
 ### Deletion
 
-Sited Environments carry the finalizer `environments.kuberik.com/deregister`. On delete the controller posts an `inactive` status `Deregistered: site <site> removed` on the site's newest deployment and removes the finalizer. A deregistered site no longer counts for membership, leadership or completion; its past selection records still do. Changing a site deregisters the old name first; re-registering the same site simply posts fresh statuses.
+Sited Environments carry the finalizer `environments.kuberik.com/deregister`. On delete the controller posts an `inactive` status `Deregistered: site <site> removed` (always with `auto_inactive: false`) on the site's newest deployment and removes the finalizer. A deregistered site no longer counts for membership, leadership or completion; its past selection records still do. GitHub's automatic `inactive` statuses (no description) appended after the marker do not undo it; any other newer status (the site deploys again) re-registers it.
+
+The identity written to GitHub (deployment name, environment, site) is recorded in `status.wave` before the first GitHub write. Changing `spec.site`, `spec.environment` or `spec.name` deregisters the old identity first, then records the new one. Removing the site altogether deregisters, releases the finalizer and clears `status.wave` and the wave conditions. Re-registering the same site simply posts fresh statuses.
+
+Wave and lockstep changes reach the other sites only with this site's next deployment, because both are read from the newest deployment's payload.
 
 Bypass when GitHub is unreachable or the cluster is dying:
 
@@ -144,7 +150,22 @@ The controller also gives up (event plus finalizer removal) when the namespace i
 kubectl patch environment X --type=merge -p '{"metadata":{"finalizers":null}}'
 ```
 
-A deregistered-by-hand site from a dead cluster stays registered until someone posts the marker; a CLI for that is a follow-up.
+Both bypasses, and a cluster that simply died, leave the site registered in GitHub. A registered site that never bakes keeps blocking the next wave and lockstep until someone posts the deregistration marker for it. The CLI for that is a follow-up; until then post the `inactive` status by hand on that site's newest deployment.
+
+### GitHub call budget
+
+Counted from the code, per reconcile (H = entries in the Rollout history, N = other Environments of the same name in the namespace that are part of the relationship graph):
+
+| | Calls |
+| --- | --- |
+| History sync of this Environment | per history entry: 1 list deployments (by ref) + 1 list statuses; plus 1 create deployment and 1 create status per missing or changed entry |
+| Relationship graph | 1 list deployments of the task, then per relevant environment the paginated deployments list and one status list per displayed deployment; each of the N other Environments repeats the history sync |
+| Wave reading, sited | for self and the upstream: up to 10 list pages (100 each), plus one status list per deployment in the newest 20 of every site; status lists are shared with the graph through a per-reconcile cache, so no deployment's statuses are fetched twice |
+| Wave reading, site-less with an upstream | 1 list page of the upstream environment (more only when it turns out to be sited) |
+| Site-less without relationship | none beyond the history sync and graph |
+| Site change or deletion | up to 10 list pages, 1 status list, 1 create status |
+
+Large fleets multiply the status lists by the number of sites. The budget relies on the `ghcache` conditional requests (ETag): a `304 Not Modified` answer does not count against the GitHub rate limit, so an idle fleet is cheap. For large fleets raise `spec.requeueInterval` (for example `5m`) so the steady-state polling stays well under the limit.
 
 ### Follow-ups
 

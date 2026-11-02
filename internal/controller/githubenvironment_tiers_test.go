@@ -185,18 +185,8 @@ var _ = Describe("Environment tiers", func() {
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			DeferCleanup(func() { Expect(k8sClient.Delete(ctx, env)).To(Succeed()) })
-			// The earlier tier baked rev-1 and is still baking rev-2 (After semantics: only rev-1 passes)
-			env.Status.EnvironmentInfos = []kuberikv1alpha1.EnvironmentInfo{{
-				Environment: "staging",
-				History: []kuberikrolloutv1alpha1.DeploymentHistoryEntry{
-					{ID: k8sptr.To(int64(2)), Version: kuberikrolloutv1alpha1.VersionInfo{Tag: "v2", Revision: k8sptr.To("rev-2")}, Timestamp: metav1.Now(), BakeStatus: k8sptr.To(kuberikrolloutv1alpha1.BakeStatusInProgress)},
-					{ID: k8sptr.To(int64(1)), Version: kuberikrolloutv1alpha1.VersionInfo{Tag: "v1", Revision: k8sptr.To("rev-1")}, Timestamp: metav1.Now(), BakeStatus: k8sptr.To(kuberikrolloutv1alpha1.BakeStatusSucceeded)},
-				},
-			}}
-			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
-
 			Expect(reconciler.createOrUpdateRolloutGate(ctx, env)).To(Succeed())
-			Expect(reconciler.updateAllowedVersions(ctx, newFakeGitHub(deployments), env, rollout)).To(Succeed())
+			Expect(reconciler.reconcileWave(ctx, newFakeGitHub(deployments), env, rollout)).To(Succeed())
 
 			gate := &kuberikrolloutv1alpha1.RolloutGate{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: env.Status.RolloutGateRef.Name, Namespace: namespace}, gate)).To(Succeed())

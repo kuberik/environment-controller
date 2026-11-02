@@ -61,6 +61,19 @@ func (f *fakeGitHub) callCount() int {
 	return len(f.calls)
 }
 
+// postCount counts POST calls (deployments and statuses created).
+func (f *fakeGitHub) postCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "POST ") {
+			n++
+		}
+	}
+	return n
+}
+
 // statusListCalls counts GET .../deployments/{id}/statuses calls per deployment ID.
 func (f *fakeGitHub) statusListCalls() map[string]int {
 	f.mu.Lock()

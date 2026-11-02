@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,12 +13,14 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/google/go-github/v62/github"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	k8sptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -27,24 +30,14 @@ import (
 	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 )
 
-// The deployment payload of a site-less Environment must stay byte-identical to
-// what was written before sites existed.
-func TestSitelessPayloadIsByteIdentical(t *testing.T) {
-	rev := "abc"
-	version := kuberikrolloutv1alpha1.VersionInfo{Tag: "v1", Revision: &rev}
-	legacy := struct {
-		ID      string                              `json:"id"`
-		Version *kuberikrolloutv1alpha1.VersionInfo `json:"version,omitempty"`
-	}{"7", &version}
-	want, _ := json.Marshal(legacy)
-	got, _ := json.Marshal(deploymentPayload{ID: "7", Version: &version})
-	if string(want) != string(got) {
-		t.Fatalf("site-less payload changed:\nwant %s\ngot  %s", want, got)
-	}
-	for _, k := range []string{"site", "wave", "lockstep", "selection"} {
-		if strings.Contains(string(got), `"`+k+`"`) {
-			t.Fatalf("site-less payload contains %q: %s", k, got)
-		}
+// A payload without site, wave and owner (written before sites existed) is read
+// as site "default", wave 1, with no owner.
+func TestLegacyPayloadIsReadAsDefaultSite(t *testing.T) {
+	r := &GitHubEnvironmentReconciler{}
+	raw := `{"id":"7","version":{"tag":"v1","revision":"abc"}}`
+	p := r.extractDeploymentPayload(&github.Deployment{Payload: json.RawMessage(raw)})
+	if p == nil || p.Site != DefaultSiteName || p.Wave != 1 || p.Owner != nil {
+		t.Fatalf("legacy payload read as %+v", p)
 	}
 }
 
@@ -68,6 +61,7 @@ var _ = Describe("Sites and waves", func() {
 		stagGH  = "kuberik/" + wApp + "/staging"
 		taskGH  = "deploy:kuberik/" + wApp
 		histSeq int64
+		extraNS []string
 	)
 
 	payload := func(site string, waveN int32, selection bool, rev, tag string) map[string]any {
@@ -159,14 +153,15 @@ var _ = Describe("Sites and waves", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "github-token", Namespace: ns},
 			Data:       map[string][]byte{"token": []byte("fake")},
 		})).To(Succeed())
-		rec = &GitHubEnvironmentReconciler{Client: k8sClient, Scheme: scheme.Scheme, GitHubBaseURL: fake.URL()}
+		rec = &GitHubEnvironmentReconciler{Client: k8sClient, Scheme: scheme.Scheme, GitHubBaseURL: fake.URL(), ClusterID: "cluster-self"}
+		extraNS = nil
 	})
 	AfterEach(func() {
 		list := &kuberikv1alpha1.EnvironmentList{}
 		Expect(k8sClient.List(ctx, list)).To(Succeed())
 		for i := range list.Items {
 			e := &list.Items[i]
-			if e.Namespace == ns {
+			if e.Namespace == ns || slices.Contains(extraNS, e.Namespace) {
 				controllerutil.RemoveFinalizer(e, DeregisterFinalizer)
 				_ = k8sClient.Update(ctx, e)
 				_ = k8sClient.Delete(ctx, e)
@@ -307,24 +302,42 @@ var _ = Describe("Sites and waves", func() {
 		}
 	})
 
-	It("keeps a site-less Environment exactly as before", func() {
+	It("registers an Environment without a site under the site \"default\"", func() {
 		mkRollout(histEntry(1, wRevA, "v1"))
 		e := mkEnv("plain", "", nil)
 		reconcile(e)
 
 		cur := get(e)
-		Expect(cur.Finalizers).To(BeEmpty())
-		Expect(cur.Status.Wave).To(BeNil())
-		Expect(cur.Status.Conditions).To(BeEmpty())
-		deps := fake.deploymentsOf(prodGH) // same GitHub environment name as always
+		Expect(controllerutil.ContainsFinalizer(cur, DeregisterFinalizer)).To(BeTrue())
+		Expect(cur.Status.Wave).NotTo(BeNil())
+		Expect(cur.Status.Wave.Site).To(Equal(DefaultSiteName))
+		Expect(cur.Status.Wave.Wave).To(Equal(int32(1)))
+		deps := fake.deploymentsOf(prodGH)
 		Expect(deps).To(HaveLen(1))
-		raw := string(decodedPayload(deps[0].Payload))
-		for _, k := range []string{"site", "wave", "lockstep", "selection"} {
-			Expect(raw).NotTo(ContainSubstring(`"` + k + `"`))
+		var p map[string]any
+		Expect(json.Unmarshal(decodedPayload(deps[0].Payload), &p)).To(Succeed())
+		Expect(p).To(HaveKeyWithValue("site", DefaultSiteName))
+		Expect(p).To(HaveKeyWithValue("wave", BeNumerically("==", 1)))
+		Expect(p).To(HaveKeyWithValue("owner", HaveKeyWithValue("cluster", rec.ClusterID)))
+		Expect(p).To(HaveKeyWithValue("owner", HaveKeyWithValue("namespace", ns)))
+		Expect(p).To(HaveKeyWithValue("owner", HaveKeyWithValue("name", "plain")))
+		for _, st := range deps[0].Statuses {
+			Expect(st.AutoInactive).NotTo(BeNil())
+			Expect(*st.AutoInactive).To(BeFalse())
 		}
-		for _, s := range deps[0].Statuses {
-			Expect(s.AutoInactive).To(BeNil())
-		}
+	})
+
+	It("reads the cluster identity from namespace kube-system when none is set", func() {
+		rec.ClusterID = ""
+		mkRollout(histEntry(1, wRevA, "v1"))
+		e := mkEnv("plain", "", nil)
+		reconcile(e)
+		kubeSystem := &corev1.Namespace{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "kube-system"}, kubeSystem)).To(Succeed())
+		Expect(rec.ClusterID).To(Equal(string(kubeSystem.UID)))
+		var p map[string]any
+		Expect(json.Unmarshal(decodedPayload(fake.deploymentsOf(prodGH)[0].Payload), &p)).To(Succeed())
+		Expect(p).To(HaveKeyWithValue("owner", HaveKeyWithValue("cluster", string(kubeSystem.UID))))
 	})
 
 	It("defaults the site from the controller", func() {
@@ -385,7 +398,7 @@ var _ = Describe("Sites and waves", func() {
 	})
 
 	Describe("history display with deregistered sites", func() {
-		It("follows newer site-less deployments once every upstream site is deregistered", func() {
+		It("follows newer legacy deployments (site default) once every upstream site is deregistered", func() {
 			stg := seed(stagGH, "stg", 1, false, wRevA, "v1", "Succeeded")
 			fake.addStatus(stg, "inactive", "Deregistered: site stg removed")
 			seed(stagGH, "", 0, false, wRevA, "v1", "Succeeded")
@@ -396,7 +409,7 @@ var _ = Describe("Sites and waves", func() {
 			Expect(*gateAllowed(e)).To(ConsistOf("v1", "v2"))
 		})
 
-		It("shows a live site-less cluster beside deregistered sited ones", func() {
+		It("shows a live legacy cluster (site default) beside deregistered sites", func() {
 			seed(stagGH, "stg", 1, false, wRevA, "v1", "Succeeded")
 			stgB := seed(stagGH, "stg", 1, false, wRevB, "v2", "Succeeded")
 			fake.addStatus(stgB, "inactive", "Deregistered: site stg removed")
@@ -465,7 +478,7 @@ var _ = Describe("Sites and waves", func() {
 			Expect(get(e).Status.Wave.Environment).To(Equal("production"))
 		})
 
-		It("deregisters, releases the finalizer and clears wave state when the site is removed", func() {
+		It("deregisters the old site and registers under \"default\" when the site is removed", func() {
 			mkRollout(histEntry(1, wRevA, "v1"))
 			e := mkEnv("eu", euSite, nil)
 			reconcile(e)
@@ -477,20 +490,21 @@ var _ = Describe("Sites and waves", func() {
 			reconcile(e)
 
 			cur = get(e)
-			Expect(controllerutil.ContainsFinalizer(cur, DeregisterFinalizer)).To(BeFalse())
-			Expect(cur.Status.Wave).To(BeNil())
-			Expect(cond(e, ConditionWaveReady)).To(BeNil())
-			Expect(cond(e, ConditionLockstepConsistent)).To(BeNil())
+			Expect(controllerutil.ContainsFinalizer(cur, DeregisterFinalizer)).To(BeTrue())
+			Expect(cur.Status.Wave).NotTo(BeNil())
+			Expect(cur.Status.Wave.Site).To(Equal(DefaultSiteName))
+			Expect(cond(e, ConditionWaveReady)).NotTo(BeNil())
 			deps := fake.deploymentsOf(prodGH)
 			var eu *fakeDep
+			sites := map[string]bool{}
 			for _, d := range deps {
+				sites[sitePayload(d)] = true
 				if sitePayload(d) == euSite {
 					eu = &d
 				}
 			}
+			Expect(sites).To(HaveKey(DefaultSiteName))
 			Expect(eu).NotTo(BeNil())
-			// The site-less status that follows may append GitHub's automatic inactive
-			// status after the marker, so look for the marker itself.
 			var marker *fakeStatus
 			for _, st := range eu.Statuses {
 				if st.Description == "Deregistered: site eu-west-1 removed" {
@@ -499,7 +513,7 @@ var _ = Describe("Sites and waves", func() {
 			}
 			Expect(marker).NotTo(BeNil())
 			Expect(marker.AutoInactive).NotTo(BeNil())
-			Expect(*marker.AutoInactive).To(BeFalse()) // even though the Environment is site-less now
+			Expect(*marker.AutoInactive).To(BeFalse())
 		})
 
 		It("re-registers a recreated Environment and other members see it again", func() {
@@ -593,7 +607,7 @@ var _ = Describe("Sites and waves", func() {
 		})
 	})
 
-	Describe("site-less Environment with a sited upstream", func() {
+	Describe("Environment on the default site with an upstream", func() {
 		It("uses only the last wave for upstream completion", func() {
 			seed(stagGH, "stg1", 1, false, wRevA, "v1", "Succeeded")
 			seed(stagGH, "stg1", 1, false, wRevB, "v2", "Succeeded")
@@ -619,6 +633,206 @@ var _ = Describe("Sites and waves", func() {
 			reconcile(e)
 			Expect(*gateAllowed(e)).To(ConsistOf("v1", "v2"))
 		})
+	})
+
+	Describe("site ownership", func() {
+		// otherNS creates a second namespace with token and rollout; mkRollout and
+		// mkEnv work in ns, so ns is switched while it is set up.
+		otherNS := func(history ...kuberikrolloutv1alpha1.DeploymentHistoryEntry) string {
+			first := ns
+			ns = fmt.Sprintf("waves-%d", atomic.AddInt32(&waveNS, 1))
+			extraNS = append(extraNS, ns)
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "github-token", Namespace: ns},
+				Data:       map[string][]byte{"token": []byte("fake")},
+			})).To(Succeed())
+			mkRollout(history...)
+			second := ns
+			ns = first
+			return second
+		}
+		inNS := func(namespace string, f func()) {
+			first := ns
+			ns = namespace
+			defer func() { ns = first }()
+			f()
+		}
+		ownedBy := func(cluster, namespace, name string) map[string]any {
+			return map[string]any{"cluster": cluster, "namespace": namespace, "name": name}
+		}
+		seedOwned := func(site string, o map[string]any, rev, tag, bake string) int64 {
+			p := payload(site, 1, false, rev, tag)
+			p["owner"] = o
+			id := fake.addDeployment(taskGH, prodGH, rev, p)
+			state, prefix := mapBakeToGitHubState(&bake)
+			fake.addStatus(id, state, prefix)
+			return id
+		}
+
+		It("gives a second Environment of the same name, tier and site DuplicateSite and posts nothing for it", func() {
+			rec.Recorder = record.NewFakeRecorder(10)
+			ns1 := ns
+			mkRollout(histEntry(1, wRevA, "v1"))
+			first := mkEnv("eu", euSite, nil)
+			reconcile(first)
+			Expect(cond(first, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+			owned := len(fake.deploymentsOf(prodGH))
+			Expect(owned).To(Equal(1))
+
+			ns2 := otherNS(histEntry(1, wRevA, "v1"), histEntry(2, wRevB, "v2"))
+			var second *kuberikv1alpha1.Environment
+			before := fake.postCount()
+			inNS(ns2, func() {
+				second = mkEnv("eu-dup", euSite, nil)
+				reconcile(second)
+
+				c := cond(second, ConditionWaveReady)
+				Expect(c).NotTo(BeNil())
+				Expect(c.Status).To(Equal(metav1.ConditionFalse))
+				Expect(c.Reason).To(Equal(ReasonDuplicateSite))
+				Expect(c.Message).To(Equal(fmt.Sprintf("site %s of prod for %s is owned by cluster cluster-self namespace %s name eu", euSite, wApp, ns1)))
+				Expect(*gateAllowed(second)).To(BeEmpty())
+				w := get(second).Status.Wave
+				Expect(w).NotTo(BeNil())
+				Expect(w.Site).To(Equal(euSite))
+				Expect(w.Wave).To(Equal(int32(1)))
+				Expect(w.Role).To(BeEmpty())
+				Expect(w.Members).To(BeEmpty())
+			})
+			Expect(fake.postCount()).To(Equal(before))
+			Expect(fake.deploymentsOf(prodGH)).To(HaveLen(owned))
+			Expect(rec.Recorder.(*record.FakeRecorder).Events).To(Receive(ContainSubstring("DuplicateSite")))
+
+			// The owner keeps working, and re-reconciling it never turns it into a duplicate.
+			reconcile(first)
+			Expect(cond(first, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+
+			// Deleting the duplicate posts no deregistration marker.
+			inNS(ns2, func() {
+				Expect(k8sClient.Delete(ctx, get(second))).To(Succeed())
+				reconcile(second)
+				Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: second.Name, Namespace: ns2}, &kuberikv1alpha1.Environment{}))).To(BeTrue())
+			})
+			Expect(fake.postCount()).To(Equal(before))
+			for _, d := range fake.deploymentsOf(prodGH) {
+				for _, st := range d.Statuses {
+					Expect(st.Description).NotTo(HavePrefix(deregisteredPrefix))
+				}
+			}
+		})
+
+		It("reports DuplicateSite when the owner is in another cluster", func() {
+			seedOwned(euSite, ownedBy("cluster-other", "team", "eu-owner"), wRevA, "v1", "Succeeded")
+			mkRollout(histEntry(1, wRevA, "v1"), histEntry(2, wRevB, "v2"))
+			e := mkEnv("eu", euSite, nil)
+			before := fake.postCount()
+			reconcile(e)
+
+			c := cond(e, ConditionWaveReady)
+			Expect(c.Reason).To(Equal(ReasonDuplicateSite))
+			Expect(c.Message).To(ContainSubstring("owned by cluster cluster-other namespace team name eu-owner"))
+			Expect(fake.postCount()).To(Equal(before))
+			Expect(*gateAllowed(e)).To(BeEmpty())
+			// A different site of the same tier is unaffected.
+			other := mkEnv("us", "us-east-1", nil)
+			reconcile(other)
+			Expect(cond(other, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+		})
+
+		It("adopts legacy deployments without site and owner as site default", func() {
+			legacy := fake.addDeployment(taskGH, prodGH, wRevA, map[string]any{"id": "1", "version": map[string]any{"tag": "v1", "revision": wRevA}})
+			fake.addStatus(legacy, stateSuccess, "Bake succeeded")
+			mkRollout(histEntry(1, wRevA, "v1"), histEntry(2, wRevB, "v2"))
+			e := mkEnv("plain", "", nil)
+			reconcile(e)
+
+			Expect(cond(e, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+			Expect(get(e).Status.Wave.Site).To(Equal(DefaultSiteName))
+			deps := fake.deploymentsOf(prodGH)
+			Expect(deps).To(HaveLen(2)) // history ID 1 re-used, ID 2 created
+			Expect(deps[0].ID).To(Equal(legacy))
+			var created map[string]any
+			Expect(json.Unmarshal(decodedPayload(deps[1].Payload), &created)).To(Succeed())
+			Expect(created).To(HaveKeyWithValue("id", "2"))
+			Expect(created).To(HaveKeyWithValue("site", DefaultSiteName))
+			Expect(created).To(HaveKeyWithValue("owner", HaveKeyWithValue("name", "plain")))
+		})
+
+		It("never matches a deployment of another owner by history ID", func() {
+			other := seedOwned(euSite, ownedBy("cluster-other", "team", "eu-owner"), wRevA, "v1", "Succeeded")
+			fake.addStatus(other, "inactive", "Deregistered: site eu-west-1 removed")
+			// Same history ID 1 as the other cluster's deployment.
+			histSeq = 0
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", euSite, nil)
+			reconcile(e)
+			Expect(cond(e, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+			deps := fake.deploymentsOf(prodGH)
+			Expect(deps).To(HaveLen(2))
+			Expect(deps[0].ID).To(Equal(other))
+			Expect(deps[0].Statuses[len(deps[0].Statuses)-1].Description).To(HavePrefix(deregisteredPrefix))
+		})
+
+		It("frees the site when the other owner deregistered", func() {
+			seedOwned(euSite, ownedBy("cluster-other", "team", "eu-owner"), wRevA, "v1", "Succeeded")
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", euSite, nil)
+			reconcile(e)
+			Expect(cond(e, ConditionWaveReady).Reason).To(Equal(ReasonDuplicateSite))
+
+			dep := fake.deploymentsOf(prodGH)[0]
+			fake.addStatus(dep.ID, "inactive", "Deregistered: site eu-west-1 removed")
+			reconcile(e)
+			Expect(cond(e, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+			deps := fake.deploymentsOf(prodGH)
+			Expect(deps).To(HaveLen(2))
+			var p map[string]any
+			Expect(json.Unmarshal(decodedPayload(deps[1].Payload), &p)).To(Succeed())
+			Expect(p).To(HaveKeyWithValue("owner", HaveKeyWithValue("cluster", "cluster-self")))
+		})
+
+		It("lets the first registration win a race", func() {
+			// Both registered; the other owner's first deployment is older.
+			seedOwned(euSite, ownedBy("cluster-other", "team", "eu-owner"), wRevA, "v1", "Succeeded")
+			seedOwned(euSite, ownedBy("cluster-self", ns, "eu"), wRevB, "v2", "Succeeded")
+			mkRollout(histEntry(1, wRevB, "v2"))
+			e := mkEnv("eu", euSite, nil)
+			reconcile(e)
+			Expect(cond(e, ConditionWaveReady).Reason).To(Equal(ReasonDuplicateSite))
+
+			// The mirror image: self registered first, so the other one is the duplicate.
+			fake.deps = nil
+			seedOwned(euSite, ownedBy("cluster-self", ns, "eu"), wRevA, "v1", "Succeeded")
+			seedOwned(euSite, ownedBy("cluster-other", "team", "eu-owner"), wRevB, "v2", "Succeeded")
+			reconcile(e)
+			Expect(cond(e, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+		})
+	})
+
+	It("accepts the deprecated spec.relationship, ignores it and reports Deprecated", func() {
+		seedStaging()
+		mkRollout(histEntry(1, wRevA, "v1"))
+		e := mkEnv("eu", euSite, nil)
+		cur := get(e)
+		cur.Spec.Relationship = &kuberikv1alpha1.EnvironmentRelationship{Environment: "staging", Type: kuberikv1alpha1.RelationshipTypeParallel}
+		Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+		reconcile(e)
+
+		c := cond(e, ConditionDeprecated)
+		Expect(c).NotTo(BeNil())
+		Expect(c.Status).To(Equal(metav1.ConditionTrue))
+		Expect(c.Reason).To(Equal(ReasonRelationshipIgnored))
+		Expect(c.Message).To(Equal("spec.relationship is ignored; environment order is fixed (dev, test, staging, prod)"))
+		// The gate is still computed from the fixed tier order.
+		Expect(*gateAllowed(e)).To(ConsistOf("v1", "v2"))
+		Expect(cond(e, ConditionWaveReady).Status).To(Equal(metav1.ConditionTrue))
+
+		cur = get(e)
+		cur.Spec.Relationship = nil
+		Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+		reconcile(e)
+		Expect(cond(e, ConditionDeprecated)).To(BeNil())
 	})
 })
 

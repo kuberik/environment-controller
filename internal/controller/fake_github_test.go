@@ -14,6 +14,8 @@ import (
 // reconciler uses, in memory. It exists so wave tests never touch real GitHub:
 // the other clusters of a fleet are simulated by seeding their deployments and
 // statuses directly.
+const stateSuccess = "success"
+
 type fakeGitHub struct {
 	mu     sync.Mutex
 	srv    *httptest.Server
@@ -99,7 +101,7 @@ func (f *fakeGitHub) addStatusLocked(d *fakeDep, s fakeStatus) {
 	d.Statuses = append(d.Statuses, s)
 	// GitHub default: a success marks older deployments of the same environment
 	// inactive unless auto_inactive=false.
-	if s.State == "success" && (s.AutoInactive == nil || *s.AutoInactive) {
+	if s.State == stateSuccess && (s.AutoInactive == nil || *s.AutoInactive) {
 		for _, o := range f.deps {
 			if o.ID < d.ID && o.Environment == d.Environment && len(o.Statuses) > 0 {
 				f.nextID++
@@ -107,16 +109,6 @@ func (f *fakeGitHub) addStatusLocked(d *fakeDep, s fakeStatus) {
 			}
 		}
 	}
-}
-
-// dep returns a copy of the deployment.
-func (f *fakeGitHub) dep(id int64) fakeDep {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	d := f.find(id)
-	cp := *d
-	cp.Statuses = append([]fakeStatus(nil), d.Statuses...)
-	return cp
 }
 
 // deploymentsOf returns copies of deployments of a GitHub environment.

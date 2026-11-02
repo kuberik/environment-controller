@@ -999,12 +999,8 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 				Relationship: normalizeRelationship(environment.Spec.Relationship),
 				Version:      h.Version.DeepCopy(),
 			}
-			if site != "" {
-				payload.Site = site
-				payload.Wave = r.effectiveWave(environment)
-				payload.Lockstep = environment.Spec.Lockstep
-				payload.Selection = isWaveLeader(environment, site)
-			}
+			r.addSiteToPayload(&payload, environment, site)
+
 			payloadJSON, err := json.Marshal(payload)
 			if err != nil {
 				return fmt.Errorf("failed to marshal deployment payload: %w", err)
@@ -1047,20 +1043,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 		// Check all statuses to see if we've already created this exact status
 		// This prevents duplicate statuses like: pending -> success -> pending
 		statuses, _, err := gh.Repositories.ListDeploymentStatuses(ctx, owner, repo, dep.GetID(), &github.ListOptions{})
-		statusExists := false
-		if err == nil && len(statuses) > 0 && !isDeregisteredStatus(statuses[0]) {
-			// A Deregistered marker as newest status means the site left and is
-			// registering again: the exact-status de-dup must not apply.
-			// Statuses are ordered newest first, so the first one is the latest
-			for _, status := range statuses {
-				if status.State != nil && *status.State == ghState && status.Description != nil && *status.Description == ghDesc {
-					// This exact status already exists, skip creating it again
-					statusExists = true
-					break
-				}
-			}
-		}
-
+		statusExists := err == nil && statusAlreadyPosted(statuses, ghState, ghDesc)
 		if !statusExists {
 			if err := r.createDeploymentStatus(ctx, gh, environment, dep.GetID(), ghState, ghDesc); err != nil {
 				return err
@@ -1069,6 +1052,21 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 	}
 
 	return nil
+}
+
+// statusAlreadyPosted reports whether the exact state+description exists among the
+// statuses (newest first). A Deregistered marker as newest status means the site
+// is registering again, so the de-dup must not apply.
+func statusAlreadyPosted(statuses []*github.DeploymentStatus, state, desc string) bool {
+	if len(statuses) == 0 || isDeregisteredStatus(statuses[0]) {
+		return false
+	}
+	for _, status := range statuses {
+		if status.State != nil && *status.State == state && status.Description != nil && *status.Description == desc {
+			return true
+		}
+	}
+	return false
 }
 
 // mapBakeToGitHubState maps bake status/message to GitHub DeploymentStatus state and description prefix
@@ -2183,4 +2181,15 @@ func (r *GitHubEnvironmentReconciler) slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// addSiteToPayload stamps site metadata on a new deployment payload (sited only).
+func (r *GitHubEnvironmentReconciler) addSiteToPayload(p *deploymentPayload, env *kuberikv1alpha1.Environment, site string) {
+	if site == "" {
+		return
+	}
+	p.Site = site
+	p.Wave = r.effectiveWave(env)
+	p.Lockstep = env.Spec.Lockstep
+	p.Selection = isWaveLeader(env, site)
 }

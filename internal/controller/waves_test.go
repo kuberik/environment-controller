@@ -107,10 +107,10 @@ var _ = Describe("Sites and waves", func() {
 		Expect(k8sClient.Status().Update(ctx, ro)).To(Succeed())
 		return ro
 	}
-	histEntry := func(id int64, rev, tag, bake string) kuberikrolloutv1alpha1.DeploymentHistoryEntry {
+	histEntry := func(id int64, rev, tag string) kuberikrolloutv1alpha1.DeploymentHistoryEntry {
 		return kuberikrolloutv1alpha1.DeploymentHistoryEntry{
 			ID: k8sptr.To(id), Version: kuberikrolloutv1alpha1.VersionInfo{Tag: tag, Revision: k8sptr.To(rev)},
-			BakeStatus: k8sptr.To(bake), Timestamp: metav1.Now(),
+			BakeStatus: k8sptr.To("Succeeded"), Timestamp: metav1.Now(),
 		}
 	}
 	mkEnv := func(name, site string, waveN *int32, rel bool) *kuberikv1alpha1.Environment {
@@ -182,7 +182,8 @@ var _ = Describe("Sites and waves", func() {
 	It("gives the wave-1 leader the upstream-complete tags and records status.wave", func() {
 		seedStaging()
 		seed(prodGH, "us-east-1", 1, false, wRevA, "v1", "Succeeded")
-		mkRollout()
+		// Self must have deployed once to count as registered (and so to lead).
+		mkRollout(histEntry(1, wRevA, "v1"))
 		e := mkEnv("eu", "eu-west-1", nil, true)
 		reconcile(e)
 
@@ -235,7 +236,7 @@ var _ = Describe("Sites and waves", func() {
 		Expect(c.Reason).To(Equal(wave.ReasonWaitingFor))
 		Expect(c.Message).To(ContainSubstring("us-east-1"))
 
-		fake.addStatus(usID, "success", "Bake succeeded")
+		fake.addStatus(usID, stateSuccess, "Bake succeeded")
 		reconcile(e)
 		Expect(*gateAllowed(e)).To(ConsistOf("v1"))
 		Expect(cond(e, ConditionWaveReady).Status).To(Equal(metav1.ConditionTrue))
@@ -255,14 +256,14 @@ var _ = Describe("Sites and waves", func() {
 
 	It("writes site metadata, selection and auto_inactive=false on sited deployments", func() {
 		seed(prodGH, "us-east-1", 1, false, wRevA, "v1", "Succeeded")
-		mkRollout(histEntry(1, wRevA, "v1", "Succeeded"))
+		mkRollout(histEntry(1, wRevA, "v1"))
 		e := mkEnv("eu", "eu-west-1", nil, false)
 		reconcile(e) // creates deployment 1 (role not yet known: selection=false)
 		reconcile(e) // role Leader is now recorded
 
 		ro := &kuberikrolloutv1alpha1.Rollout{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rollout", Namespace: ns}, ro)).To(Succeed())
-		ro.Status.History = append([]kuberikrolloutv1alpha1.DeploymentHistoryEntry{histEntry(2, wRevB, "v2", "Succeeded")}, ro.Status.History...)
+		ro.Status.History = append([]kuberikrolloutv1alpha1.DeploymentHistoryEntry{histEntry(2, wRevB, "v2")}, ro.Status.History...)
 		Expect(k8sClient.Status().Update(ctx, ro)).To(Succeed())
 		reconcile(e)
 
@@ -311,7 +312,7 @@ var _ = Describe("Sites and waves", func() {
 	})
 
 	It("keeps a site-less Environment exactly as before", func() {
-		mkRollout(histEntry(1, wRevA, "v1", "Succeeded"))
+		mkRollout(histEntry(1, wRevA, "v1"))
 		e := mkEnv("plain", "", nil, false)
 		reconcile(e)
 
@@ -341,7 +342,7 @@ var _ = Describe("Sites and waves", func() {
 	})
 
 	It("posts the Deregistered marker on deletion and removes the finalizer", func() {
-		mkRollout(histEntry(1, wRevA, "v1", "Succeeded"))
+		mkRollout(histEntry(1, wRevA, "v1"))
 		e := mkEnv("eu", "eu-west-1", nil, false)
 		reconcile(e)
 		Expect(k8sClient.Delete(ctx, get(e))).To(Succeed())
@@ -357,7 +358,7 @@ var _ = Describe("Sites and waves", func() {
 	})
 
 	It("skips GitHub entirely with the skip-deregister annotation", func() {
-		mkRollout(histEntry(1, wRevA, "v1", "Succeeded"))
+		mkRollout(histEntry(1, wRevA, "v1"))
 		e := mkEnv("eu", "eu-west-1", nil, false)
 		reconcile(e)
 		cur := get(e)

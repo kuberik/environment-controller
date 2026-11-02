@@ -161,9 +161,9 @@ func (r *GitHubEnvironmentReconciler) ownSitesByEnv(current *kuberikv1alpha1.Env
 		if e.Spec.Name != current.Spec.Name || e.Spec.Environment == "" {
 			continue
 		}
-		own[e.Spec.Environment] = r.effectiveSite(e)
+		own[canonicalEnv(e.Spec.Environment)] = r.effectiveSite(e)
 	}
-	own[current.Spec.Environment] = r.effectiveSite(current)
+	own[canonicalEnv(current.Spec.Environment)] = r.effectiveSite(current)
 	return own
 }
 
@@ -281,67 +281,112 @@ func bakeOf(statuses []*github.DeploymentStatus) string {
 	return *entry.BakeStatus
 }
 
-// readMembers reads the sited members of the given environments from GitHub.
-//
-// Call budget per reconcile (sited): <=10 list calls per environment (self and
-// upstream; 1 when site-less and no sited deployment) plus one status fetch per
-// deployment in the newest-deploymentsPerSite window of every site, shared with
-// history building through the per-reconcile cache. Nothing is fetched per
-// member beyond that window.
-func (r *GitHubEnvironmentReconciler) readMembers(ctx context.Context, gh *github.Client, owner, repo, deploymentName string, envs []string, stopIfSiteless bool) ([]wave.Member, error) {
-	task := formatDeploymentTask(deploymentName)
-	var members []wave.Member
-	for _, env := range envs {
-		deps, err := r.listEnvDeployments(ctx, gh, owner, repo, task, formatDeploymentEnvironment(deploymentName, env), stopIfSiteless)
+// listTierDeployments lists the deployments of every alias of a tier (the GitHub
+// environment keeps the name written in spec, so "prod" and "production" are
+// separate GitHub environments of one tier), newest first.
+func (r *GitHubEnvironmentReconciler) listTierDeployments(ctx context.Context, gh *github.Client, owner, repo, task, deploymentName, tier string, stopIfSiteless bool) ([]*github.Deployment, error) {
+	var all []*github.Deployment
+	for _, alias := range wave.Aliases(tier) {
+		deps, err := r.listEnvDeployments(ctx, gh, owner, repo, task, formatDeploymentEnvironment(deploymentName, alias), stopIfSiteless)
 		if err != nil {
 			return nil, err
 		}
-		bySite := map[string][]*github.Deployment{}
-		for _, d := range deps {
+		all = append(all, deps...)
+	}
+	sort.SliceStable(all, func(i, j int) bool { return all[i].GetID() > all[j].GetID() })
+	return all, nil
+}
+
+// membersOf reduces the deployments of one tier to its sited members. Site-less
+// deployments are ignored for wave logic.
+//
+// Call budget: one status fetch per deployment in the newest-deploymentsPerSite
+// window of every site, shared with history building through the per-reconcile
+// cache. Nothing is fetched per member beyond that window.
+func (r *GitHubEnvironmentReconciler) membersOf(ctx context.Context, gh *github.Client, owner, repo, tier string, deps []*github.Deployment) ([]wave.Member, error) {
+	var members []wave.Member
+	bySite := map[string][]*github.Deployment{}
+	for _, d := range deps {
+		p := r.extractDeploymentPayload(d)
+		if p == nil || p.Site == "" || p.Version == nil || p.Version.Revision == nil || *p.Version.Revision == "" {
+			continue
+		}
+		bySite[p.Site] = append(bySite[p.Site], d)
+	}
+	siteNames := make([]string, 0, len(bySite))
+	for s := range bySite {
+		siteNames = append(siteNames, s)
+	}
+	sort.Strings(siteNames)
+	for _, s := range siteNames {
+		sd := bySite[s]
+		sort.Slice(sd, func(i, j int) bool { return sd[i].GetID() > sd[j].GetID() })
+		if len(sd) > deploymentsPerSite {
+			sd = sd[:deploymentsPerSite]
+		}
+		m := wave.Member{Environment: tier, Site: s}
+		for i, d := range sd {
 			p := r.extractDeploymentPayload(d)
-			if p == nil || p.Site == "" || p.Version == nil || p.Version.Revision == nil || *p.Version.Revision == "" {
-				continue // site-less deployments are ignored for wave logic
+			statuses, err := r.fetchAllDeploymentStatuses(ctx, gh, owner, repo, d.GetID())
+			if err != nil {
+				return nil, fmt.Errorf("failed to read statuses of deployment %d: %w", d.GetID(), err)
 			}
-			bySite[p.Site] = append(bySite[p.Site], d)
-		}
-		siteNames := make([]string, 0, len(bySite))
-		for s := range bySite {
-			siteNames = append(siteNames, s)
-		}
-		sort.Strings(siteNames)
-		for _, s := range siteNames {
-			sd := bySite[s]
-			sort.Slice(sd, func(i, j int) bool { return sd[i].GetID() > sd[j].GetID() })
-			if len(sd) > deploymentsPerSite {
-				sd = sd[:deploymentsPerSite]
+			if i == 0 { // newest deployment defines wave, lockstep and registration
+				m.Wave = max(p.Wave, 1)
+				m.Lockstep = p.Lockstep
+				m.Deregistered = isDeregistered(statuses)
 			}
-			m := wave.Member{Environment: env, Site: s}
-			for i, d := range sd {
-				p := r.extractDeploymentPayload(d)
-				statuses, err := r.fetchAllDeploymentStatuses(ctx, gh, owner, repo, d.GetID())
-				if err != nil {
-					return nil, fmt.Errorf("failed to read statuses of deployment %d: %w", d.GetID(), err)
-				}
-				if i == 0 { // newest deployment defines wave, lockstep and registration
-					m.Wave = p.Wave
-					if m.Wave < 1 {
-						m.Wave = 1
-					}
-					m.Lockstep = p.Lockstep
-					m.Deregistered = isDeregistered(statuses)
-				}
-				m.Deployments = append(m.Deployments, wave.Deployment{
-					Revision:  *p.Version.Revision,
-					Wave:      max(p.Wave, 1),
-					Selection: p.Selection,
-					Bake:      bakeOf(statuses),
-					Order:     d.GetID(),
-				})
-			}
-			members = append(members, m)
+			m.Deployments = append(m.Deployments, wave.Deployment{
+				Revision:  *p.Version.Revision,
+				Wave:      max(p.Wave, 1),
+				Selection: p.Selection,
+				Bake:      bakeOf(statuses),
+				Order:     d.GetID(),
+			})
 		}
+		members = append(members, m)
 	}
 	return members, nil
+}
+
+// readMembers reads the sited members of one tier from GitHub (all aliases).
+func (r *GitHubEnvironmentReconciler) readMembers(ctx context.Context, gh *github.Client, owner, repo, deploymentName, tier string) ([]wave.Member, error) {
+	deps, err := r.listTierDeployments(ctx, gh, owner, repo, formatDeploymentTask(deploymentName), deploymentName, tier, false)
+	if err != nil {
+		return nil, err
+	}
+	return r.membersOf(ctx, gh, owner, repo, tier, deps)
+}
+
+// findUpstream returns the nearest earlier tier of self that is present in
+// GitHub for this deployment name: it has registered sited members (returned as
+// members) or, failing that, site-less deployments (members empty). Empty tiers
+// are skipped. "" means no earlier tier is present.
+//
+// Call budget: per earlier tier examined, one list call per alias (first page
+// only when the tier is site-less), plus the status fetches of membersOf for
+// sited tiers.
+func (r *GitHubEnvironmentReconciler) findUpstream(ctx context.Context, gh *github.Client, owner, repo, deploymentName, self string) (string, []wave.Member, error) {
+	task := formatDeploymentTask(deploymentName)
+	for _, tier := range wave.EarlierTiers(self) {
+		deps, err := r.listTierDeployments(ctx, gh, owner, repo, task, deploymentName, tier, true)
+		if err != nil {
+			return "", nil, err
+		}
+		members, err := r.membersOf(ctx, gh, owner, repo, tier, deps)
+		if err != nil {
+			return "", nil, err
+		}
+		if sitedRegistered(members, tier) {
+			return tier, members, nil
+		}
+		for _, d := range deps {
+			if p := r.extractDeploymentPayload(d); p != nil && p.Site == "" {
+				return tier, nil, nil
+			}
+		}
+	}
+	return "", nil, nil
 }
 
 func newestDeployment(m wave.Member) (wave.Deployment, bool) {
@@ -419,18 +464,16 @@ func (r *GitHubEnvironmentReconciler) reconcileWave(ctx context.Context, gh *git
 		return err
 	}
 	deploymentName := ensureKuberikPrefix(env.Spec.Name)
-	upstream := ""
-	if env.Spec.Relationship != nil {
-		upstream = env.Spec.Relationship.Environment
-	}
-	envs := []string{env.Spec.Environment}
-	if upstream != "" && upstream != env.Spec.Environment {
-		envs = append(envs, upstream)
-	}
-	members, err := r.readMembers(ctx, gh, owner, repo, deploymentName, envs, false)
+	self := canonicalEnv(env.Spec.Environment)
+	upstream, upMembers, err := r.findUpstream(ctx, gh, owner, repo, deploymentName, self)
 	if err != nil {
 		return err
 	}
+	members, err := r.readMembers(ctx, gh, owner, repo, deploymentName, self)
+	if err != nil {
+		return err
+	}
+	members = append(members, upMembers...)
 
 	site := r.effectiveSite(env)
 	pinned := ""
@@ -439,7 +482,7 @@ func (r *GitHubEnvironmentReconciler) reconcileWave(ctx context.Context, gh *git
 	}
 	in := wave.Input{
 		Self: wave.Self{
-			Environment:   env.Spec.Environment,
+			Environment:   self,
 			Site:          site,
 			Wave:          r.effectiveWave(env),
 			Lockstep:      env.Spec.Lockstep,
@@ -450,7 +493,7 @@ func (r *GitHubEnvironmentReconciler) reconcileWave(ctx context.Context, gh *git
 		Candidates: candidatesOf(rollout),
 		Current:    currentRevision(rollout),
 	}
-	if upstream != "" && upstream != env.Spec.Environment && !sitedRegistered(members, upstream) {
+	if upstream != "" && !sitedRegistered(members, upstream) {
 		in.UpstreamSiteless = true
 		in.UpstreamBaked = upstreamBakedRevisions(env, upstream)
 	}
@@ -542,26 +585,28 @@ func (r *GitHubEnvironmentReconciler) setGateAllowedVersions(ctx context.Context
 	return nil
 }
 
-// updateAllowedVersions is the gate update for site-less Environments. When the
-// upstream environment is sited it uses wave.UpstreamComplete; otherwise the
-// existing single-stream path runs unchanged.
+// updateAllowedVersions is the gate update for site-less Environments: the
+// nearest earlier tier that is present decides. A sited upstream uses
+// wave.UpstreamComplete; a site-less one passes the revisions it baked
+// Succeeded. With no earlier tier the gate is unrestricted.
 func (r *GitHubEnvironmentReconciler) updateAllowedVersions(ctx context.Context, gh *github.Client, env *kuberikv1alpha1.Environment, rollout *kuberikrolloutv1alpha1.Rollout) error {
-	if env.Spec.Relationship == nil || env.Status.RolloutGateRef == nil {
-		return r.updateAllowedVersionsFromRelationships(ctx, env)
+	if env.Status.RolloutGateRef == nil {
+		return nil
 	}
 	owner, repo, err := parseProject(env.Spec.Backend.Project)
 	if err != nil {
 		return err
 	}
-	upstream := env.Spec.Relationship.Environment
-	// DECISION: a site-less fleet pays exactly one extra list call (first page of
-	// the upstream environment) to learn the upstream is site-less.
-	members, err := r.readMembers(ctx, gh, owner, repo, ensureKuberikPrefix(env.Spec.Name), []string{upstream}, true)
+	upstream, members, err := r.findUpstream(ctx, gh, owner, repo, ensureKuberikPrefix(env.Spec.Name), canonicalEnv(env.Spec.Environment))
 	if err != nil {
 		return err
 	}
+	if upstream == "" {
+		return r.setGateAllowedVersions(ctx, env, nil)
+	}
 	if !sitedRegistered(members, upstream) {
-		return r.updateAllowedVersionsFromRelationships(ctx, env)
+		tags := siteLessGateTags(env, upstream, rollout)
+		return r.setGateAllowedVersions(ctx, env, &tags)
 	}
 	revs, blocker := wave.UpstreamComplete(upstream, members)
 	tags := []string{}

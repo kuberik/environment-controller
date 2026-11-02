@@ -26,36 +26,6 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// RelationshipType defines the type of relationship between environments
-type RelationshipType string
-
-const (
-	// RelationshipTypeAfter means this environment deploys a version only after the related
-	// environment has deployed it successfully (its bake succeeded).
-	RelationshipTypeAfter RelationshipType = "After"
-	// RelationshipTypeAlongside means this environment follows the related environment and
-	// deploys the same version alongside it: a version may deploy here as soon as the related
-	// environment has started deploying it, as long as that deployment has not failed or been
-	// cancelled. Use it for an environment that should track another environment's version
-	// (including its manual approvals) without a gate of its own.
-	RelationshipTypeAlongside RelationshipType = "Alongside"
-)
-
-// EnvironmentRelationship defines a relationship to another environment
-type EnvironmentRelationship struct {
-	// Environment is the environment name this environment relates to
-	// +required
-	Environment string `json:"environment"`
-
-	// Type is the type of relationship:
-	// - "After": deploy a version only once it has been successfully deployed to the related environment.
-	// - "Alongside": deploy the same version as the related environment as soon as that environment
-	//   starts deploying it, unless its deployment there failed or was cancelled.
-	// +required
-	// +kubebuilder:validation:Enum=After;Alongside
-	Type RelationshipType `json:"type"`
-}
-
 // BackendConfig contains backend-specific configuration
 type BackendConfig struct {
 	// Type specifies the backend to use (e.g., "github")
@@ -83,13 +53,15 @@ type EnvironmentSpec struct {
 	// +required
 	Name string `json:"name"`
 
-	// Environment is the environment name (e.g., "production", "staging")
-	// +optional
-	Environment string `json:"environment,omitempty"`
-
-	// Relationship defines how this environment relates to another environment
-	// +optional
-	Relationship *EnvironmentRelationship `json:"relationship,omitempty"`
+	// Environment is the tier this Environment belongs to. Tiers have a fixed
+	// order, earliest first: dev, test, staging, prod. Each tier accepts the
+	// aliases listed below; aliases of one tier are the same environment for
+	// wave grouping, upstream lookup and GitHub matching (the GitHub
+	// environment name is kept as written here). An Environment is gated on
+	// the nearest earlier tier that has registered sites for the same name.
+	// +required
+	// +kubebuilder:validation:Enum=dev;development;test;qa;staging;stage;preprod;prod;production
+	Environment string `json:"environment"`
 
 	// Backend contains backend-specific configuration
 	// +required
@@ -140,17 +112,13 @@ type EnvironmentStatusEntry struct {
 
 // EnvironmentInfo represents information about an environment's deployment.
 type EnvironmentInfo struct {
-	// Environment is the environment name
+	// Environment is the canonical tier name (dev, test, staging, prod)
 	// +required
 	Environment string `json:"environment"`
 
 	// EnvironmentURL is the URL of the actual deployed environment (e.g., dashboard URL)
 	// +optional
 	EnvironmentURL string `json:"environmentUrl,omitempty"`
-
-	// Relationship defines how this environment relates to another environment
-	// +optional
-	Relationship *EnvironmentRelationship `json:"relationship,omitempty"`
 
 	// History contains deployment history entries for this environment
 	// +listType=atomic

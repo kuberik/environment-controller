@@ -46,6 +46,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
+	"github.com/kuberik/environment-controller/internal/wave"
 	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 )
 
@@ -56,7 +57,7 @@ const (
 	// defaultSecretName is the GitHub token Secret used when Backend.Secret is unset.
 	defaultSecretName = "github-token"
 	// productionEnvironment is the environment that is reported to GitHub as a production environment
-	productionEnvironment = "production"
+	productionEnvironment = "prod"
 	// rolloutDashboardServiceName is the name of the rollout-dashboard service in the controller's namespace
 	rolloutDashboardServiceName = "rollout-dashboard"
 
@@ -85,9 +86,8 @@ const (
 // deploymentPayload represents the payload stored in GitHub deployments
 // Only immutable data should be stored here since GitHub deployments cannot be updated
 type deploymentPayload struct {
-	ID           string                                   `json:"id"`                     // History entry ID (immutable)
-	Relationship *kuberikv1alpha1.EnvironmentRelationship `json:"relationship,omitempty"` // Relationship for this environment
-	Version      *kuberikrolloutv1alpha1.VersionInfo      `json:"version,omitempty"`      // Version information (immutable)
+	ID      string                              `json:"id"`                // History entry ID (immutable)
+	Version *kuberikrolloutv1alpha1.VersionInfo `json:"version,omitempty"` // Version information (immutable)
 
 	// Sites and waves. All omitempty so a site-less payload is byte-identical to
 	// what was written before sites existed.
@@ -202,7 +202,7 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	// Build relationship graph
-	graphData, err := r.buildRelationshipGraph(ctx, deployment, githubClient)
+	graphData, err := r.buildEnvironmentGraph(ctx, deployment, githubClient)
 	if err != nil {
 		logger.Error(err, "Failed to build relationship graph")
 		return ctrl.Result{}, err
@@ -411,11 +411,11 @@ func (r *GitHubEnvironmentReconciler) getCurrentVersionFromRollout(rollout *kube
 }
 
 // updateStatus updates the Environment status with all gathered information
-func (r *GitHubEnvironmentReconciler) updateStatus(ctx context.Context, environment *kuberikv1alpha1.Environment, graphData *relationshipGraphData) error {
+func (r *GitHubEnvironmentReconciler) updateStatus(ctx context.Context, environment *kuberikv1alpha1.Environment, graphData *environmentGraphData) error {
 	newStatus := environment.Status.DeepCopy()
 
 	// Update current version - get from graphData history for current environment
-	currentEnv := environment.Spec.Environment
+	currentEnv, _ := wave.Canonical(environment.Spec.Environment)
 	if history, ok := graphData.envHistory[currentEnv]; ok && len(history) > 0 {
 		// History is already sorted descending
 		if history[0].Version.Revision != nil {
@@ -453,17 +453,15 @@ func (r *GitHubEnvironmentReconciler) updateStatus(ctx context.Context, environm
 }
 
 // buildEnvironmentInfos builds the list of environment infos from graph data
-func (r *GitHubEnvironmentReconciler) buildEnvironmentInfos(environment *kuberikv1alpha1.Environment, graphData *relationshipGraphData) []kuberikv1alpha1.EnvironmentInfo {
+func (r *GitHubEnvironmentReconciler) buildEnvironmentInfos(environment *kuberikv1alpha1.Environment, graphData *environmentGraphData) []kuberikv1alpha1.EnvironmentInfo {
 	if environment.Status.EnvironmentInfos == nil {
 		environment.Status.EnvironmentInfos = []kuberikv1alpha1.EnvironmentInfo{}
 	}
 
-	// Make a deep copy of the environment infos. Relationships are normalized because status
-	// written by an older controller may still hold a type the CRD no longer accepts.
+	// Make a deep copy of the environment infos.
 	environmentInfoList := make([]kuberikv1alpha1.EnvironmentInfo, len(environment.Status.EnvironmentInfos))
 	for i := range environment.Status.EnvironmentInfos {
 		environmentInfoList[i] = *environment.Status.EnvironmentInfos[i].DeepCopy()
-		environmentInfoList[i].Relationship = normalizeRelationship(environmentInfoList[i].Relationship)
 	}
 
 	// Update or add environment infos with history from graphData
@@ -478,33 +476,16 @@ func (r *GitHubEnvironmentReconciler) buildEnvironmentInfos(environment *kuberik
 			}
 		}
 
-		// Check if environment is directly connected to current environment
-		// - It is the current environment
-		// - Current environment depends on it
-		// - It depends on current environment
-		isDirectlyConnected := false
-		currentEnv := environment.Spec.Environment
-
-		if envName == currentEnv {
-			isDirectlyConnected = true
-		} else {
-			// Check if current environment depends on this env
-			if environment.Spec.Relationship != nil && environment.Spec.Relationship.Environment == envName {
-				isDirectlyConnected = true
-			}
-			// Check if this env depends on current environment
-			if info.Relationship != nil && info.Relationship.Environment == currentEnv {
-				isDirectlyConnected = true
-			}
-		}
+		// Directly connected: the current tier and its neighbours among the tiers present.
+		isDirectlyConnected := directlyConnected(environment.Spec.Environment, envName, graphData.environmentInfos)
 
 		// If not directly connected, keep only the latest deployment history
 		if !isDirectlyConnected && len(history) > 1 {
-			// History is already sorted descending by ID/Revision in buildRelationshipGraph
+			// History is already sorted descending by ID/Revision in buildEnvironmentGraph
 			history = []kuberikrolloutv1alpha1.DeploymentHistoryEntry{history[0]}
 		}
 
-		environmentInfoList = updateEnvironmentInfoWithHistory(environmentInfoList, envName, info.EnvironmentURL, info.Relationship, history)
+		environmentInfoList = updateEnvironmentInfoWithHistory(environmentInfoList, envName, info.EnvironmentURL, history)
 	}
 
 	// Preserve existing environmentInfos... (same logic as before)
@@ -512,50 +493,24 @@ func (r *GitHubEnvironmentReconciler) buildEnvironmentInfos(environment *kuberik
 	// and updateEnvironmentInfoWithHistory updates in place or appends.
 
 	// Sort (same logic as before)
-	// Pre-calculate max IDs and parent map
+	// Tiers sort earliest first; unknown names after them, by latest history ID then name.
 	maxIDMap := make(map[string]int64)
-	parentMap := make(map[string]string)
 	for _, info := range environmentInfoList {
 		maxIDMap[info.Environment] = getMaxHistoryID(info.History)
-		if info.Relationship != nil && info.Relationship.Environment != "" {
-			parentMap[info.Environment] = info.Relationship.Environment
-		}
 	}
-
-	// Recursive helper to check if envA is an ancestor of envB
-	var isAncestor func(envA, envB string) bool
-	isAncestor = func(envA, envB string) bool {
-		parent, exists := parentMap[envB]
-		if !exists {
-			return false
-		}
-		if parent == envA {
-			return true
-		}
-		return isAncestor(envA, parent)
-	}
-
 	sort.SliceStable(environmentInfoList, func(i, j int) bool {
 		envI := environmentInfoList[i].Environment
 		envJ := environmentInfoList[j].Environment
-
-		// If envI is an ancestor of envJ, envI comes first
-		if isAncestor(envI, envJ) {
-			return true
+		rI, rJ := wave.Rank(envI), wave.Rank(envJ)
+		if (rI >= 0) != (rJ >= 0) {
+			return rI >= 0
 		}
-		// If envJ is an ancestor of envI, envJ comes first
-		if isAncestor(envJ, envI) {
-			return false
+		if rI != rJ {
+			return rI < rJ
 		}
-
-		// Tie-breaker: higher max history ID first
-		idI := maxIDMap[envI]
-		idJ := maxIDMap[envJ]
-		if idI != idJ {
-			return idI > idJ
+		if maxIDMap[envI] != maxIDMap[envJ] {
+			return maxIDMap[envI] > maxIDMap[envJ]
 		}
-
-		// Last tie-breaker: environment name for stable sort
 		return envI < envJ
 	})
 
@@ -856,30 +811,7 @@ func (r *GitHubEnvironmentReconciler) extractDeploymentPayload(dep *github.Deplo
 	if payload.ID == "" || payload.Version == nil {
 		return nil
 	}
-	// Payloads can be written by other clusters' controllers, possibly older ones that still use
-	// relationship types this version doesn't know (e.g. the removed "Parallel").
-	payload.Relationship = normalizeRelationship(payload.Relationship)
-
 	return &payload
-}
-
-// normalizeRelationship returns a copy of rel whose type is one this controller knows.
-// Relationships are read from places the CRD's enum doesn't guard: GitHub deployment payloads
-// written by other (possibly older) controllers, Environments stored before a CRD upgrade, and
-// status written by an older controller. Any other type, such as the removed "Parallel", is
-// treated as "After". That matches how older controllers gated such environments, and it keeps
-// the value valid for this controller's status, which the CRD's enum would otherwise reject.
-func normalizeRelationship(rel *kuberikv1alpha1.EnvironmentRelationship) *kuberikv1alpha1.EnvironmentRelationship {
-	if rel == nil {
-		return nil
-	}
-	normalized := rel.DeepCopy()
-	switch normalized.Type {
-	case kuberikv1alpha1.RelationshipTypeAfter, kuberikv1alpha1.RelationshipTypeAlongside:
-	default:
-		normalized.Type = kuberikv1alpha1.RelationshipTypeAfter
-	}
-	return normalized
 }
 
 // extractDeploymentKey extracts the deployment key from a GitHub deployment's payload and environment
@@ -994,9 +926,8 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 			// Only store immutable data in payload: ID, relationship, and version
 			// Status and other mutable fields come from GitHub deployment statuses
 			payload := deploymentPayload{
-				ID:           historyID,
-				Relationship: normalizeRelationship(environment.Spec.Relationship),
-				Version:      h.Version.DeepCopy(),
+				ID:      historyID,
+				Version: h.Version.DeepCopy(),
 			}
 			r.addSiteToPayload(&payload, environment, site)
 
@@ -1010,7 +941,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 				Task:                  &task,
 				Environment:           &formattedEnv,
 				Description:           h.Message,
-				ProductionEnvironment: github.Bool(environment.Spec.Environment == productionEnvironment),
+				ProductionEnvironment: github.Bool(canonicalEnv(environment.Spec.Environment) == productionEnvironment),
 				AutoMerge:             github.Bool(false),
 				Payload:               payloadJSON,
 				RequiredContexts:      k8sptr.To([]string{}),
@@ -1312,20 +1243,8 @@ func (r *GitHubEnvironmentReconciler) fetchAllDeploymentStatuses(ctx context.Con
 // This function sets all fields that should be managed by this controller, whether creating or updating.
 func (r *GitHubEnvironmentReconciler) applyRolloutGateDesiredState(rolloutGate *kuberikrolloutv1alpha1.RolloutGate, deployment *kuberikv1alpha1.Environment) error {
 	// Set annotations
-	prettyName := "Relationship not ready yet"
-	var description string
-	if deployment.Spec.Relationship != nil {
-		relatedEnv := deployment.Spec.Relationship.Environment
-		switch deployment.Spec.Relationship.Type {
-		case kuberikv1alpha1.RelationshipTypeAlongside:
-			description = fmt.Sprintf("This gate passes versions as soon as the %s environment starts deploying them, unless the deployment there has failed or been cancelled.", relatedEnv)
-		default:
-			// After, and any type this controller doesn't know (see normalizeRelationship)
-			description = fmt.Sprintf("This gate is passing only for those versions that have been successfully deployed after the %s environment.", relatedEnv)
-		}
-	} else {
-		description = "This gate is passing only for those versions that have been successfully deployed to the related environment."
-	}
+	prettyName := "Previous environment not ready yet"
+	description := "This gate is passing only for those versions that have been successfully deployed to the previous environment tier (dev, test, staging, prod) or the previous wave."
 
 	if rolloutGate.Annotations == nil {
 		rolloutGate.Annotations = make(map[string]string)
@@ -1470,11 +1389,10 @@ func findOwnedRolloutGate(gates []kuberikrolloutv1alpha1.RolloutGate, environmen
 // environmentInfo holds information about an environment's deployment
 type environmentInfo struct {
 	EnvironmentURL string
-	Relationship   *kuberikv1alpha1.EnvironmentRelationship
 }
 
-// relationshipGraphData holds the data needed for relationship-based operations
-type relationshipGraphData struct {
+// environmentGraphData holds the data about every environment tier of one app
+type environmentGraphData struct {
 	relevantEnvironments map[string]bool
 	relevantVersions     map[string]bool
 	envDeployments       map[string][]*github.Deployment
@@ -1485,10 +1403,11 @@ type relationshipGraphData struct {
 	environmentInfos      map[string]environmentInfo
 }
 
-// buildRelationshipGraph discovers all environments and builds the relationship graph
+// buildEnvironmentGraph discovers all environment tiers of the app and reads their history.
+// Environment names are canonical tiers (see wave.Canonical): aliases are one environment.
 //
-//nolint:gocyclo // Core relationship logic, deliberately left unchanged by the lint cleanup; split it up in its own change.
-func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context, environment *kuberikv1alpha1.Environment, ghClient *github.Client) (*relationshipGraphData, error) {
+//nolint:gocyclo // Core graph logic, deliberately left unchanged by the lint cleanup; split it up in its own change.
+func (r *GitHubEnvironmentReconciler) buildEnvironmentGraph(ctx context.Context, environment *kuberikv1alpha1.Environment, ghClient *github.Client) (*environmentGraphData, error) {
 	owner, repo, err := parseProject(environment.Spec.Backend.Project)
 	if err != nil {
 		return nil, err
@@ -1497,14 +1416,10 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 	// Ensure deployment name has kuberik prefix for GitHub
 	deploymentName := ensureKuberikPrefix(environment.Spec.Name)
 
-	// Build relationship graph to determine relevant environments
-	// Relevant environments are: current environment + all environments related to it (directly or transitively)
+	// Relevant environments are every tier of this app, keyed by canonical tier name
 	relevantEnvironments := make(map[string]bool)
-	currentEnv := environment.Spec.Environment
+	currentEnv, _ := wave.Canonical(environment.Spec.Environment)
 	relevantEnvironments[currentEnv] = true
-
-	// Build a map of environment -> relationships from all discovered environments
-	envRelationships := make(map[string]*kuberikv1alpha1.EnvironmentRelationship)
 
 	// Query all deployments with the same task to discover all environments
 	task := formatDeploymentTask(deploymentName)
@@ -1529,14 +1444,8 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 		// The environment format is "deploymentName/environment", so split and take the last part
 		envParts := strings.Split(env, "/")
 		if len(envParts) > 0 {
-			envName := envParts[len(envParts)-1]
+			envName, _ := wave.Canonical(envParts[len(envParts)-1])
 			envDeployments[envName] = append(envDeployments[envName], d)
-
-			// Extract relationship from payload
-			payload := r.extractDeploymentPayload(d)
-			if payload != nil && payload.Relationship != nil {
-				envRelationships[envName] = payload.Relationship
-			}
 		}
 	}
 
@@ -1553,16 +1462,11 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 			if env.Spec.Environment == "" {
 				continue
 			}
-			envName := env.Spec.Environment
+			envName, _ := wave.Canonical(env.Spec.Environment)
 
 			// Add to discovered environments
 			if envDeployments[envName] == nil {
 				envDeployments[envName] = []*github.Deployment{}
-			}
-
-			// Extract relationship from Environment spec
-			if env.Spec.Relationship != nil {
-				envRelationships[envName] = normalizeRelationship(env.Spec.Relationship)
 			}
 		}
 	}
@@ -1574,32 +1478,11 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 		envDeployments[envName] = r.displayDeployments(ctx, ghClient, owner, repo, envName, deps, ownSites)
 	}
 
-	// Build set of relevant environments based on relationships
-	// Start with current environment and traverse relationships
-	visited := make(map[string]bool)
-	var traverseRelationships func(env string)
-	traverseRelationships = func(env string) {
-		if visited[env] {
-			return
-		}
-		visited[env] = true
-		relevantEnvironments[env] = true
-
-		// Find all environments that have a relationship pointing to this environment
-		for otherEnv, rel := range envRelationships {
-			if rel != nil && rel.Environment == env {
-				traverseRelationships(otherEnv)
-			}
-		}
-
-		// Also traverse environments that this environment relates to
-		if rel, exists := envRelationships[env]; exists && rel != nil {
-			traverseRelationships(rel.Environment)
-		}
+	for envName := range envDeployments {
+		relevantEnvironments[envName] = true
 	}
-	traverseRelationships(currentEnv)
 
-	// Track environment info (environment URL and relationship) for all environments
+	// Track environment info (environment URL) for all environments
 	environmentInfos := make(map[string]environmentInfo)
 
 	// First, update environment infos from GitHub deployments
@@ -1608,15 +1491,9 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 			continue
 		}
 
-		// Track the latest environment URL and relationship (first deployment in list is latest)
+		// Track the latest environment URL (first deployment in list is latest)
 		latestDeployment := deployments[0]
 		envInfo := environmentInfo{}
-
-		// Extract relationship from the latest deployment's payload
-		payload := r.extractDeploymentPayload(latestDeployment)
-		if payload != nil && payload.Relationship != nil {
-			envInfo.Relationship = payload.Relationship
-		}
 
 		// Extract environment URL from the latest deployment's statuses
 		statuses, err := r.fetchAllDeploymentStatuses(ctx, ghClient, owner, repo, latestDeployment.GetID())
@@ -1637,20 +1514,11 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 		if env.Spec.Name != environment.Spec.Name || env.Spec.Environment == "" {
 			continue
 		}
-		envName := env.Spec.Environment
+		envName, _ := wave.Canonical(env.Spec.Environment)
 
 		// Only add if not already set from GitHub deployments and if it's a relevant environment
-		existingInfo, exists := environmentInfos[envName]
-		if !exists && relevantEnvironments[envName] {
-			envInfo := environmentInfo{}
-			if env.Spec.Relationship != nil {
-				envInfo.Relationship = normalizeRelationship(env.Spec.Relationship)
-			}
-			environmentInfos[envName] = envInfo
-		} else if exists && existingInfo.Relationship == nil && env.Spec.Relationship != nil {
-			// Update relationship from Environment spec if not set from GitHub
-			existingInfo.Relationship = normalizeRelationship(env.Spec.Relationship)
-			environmentInfos[envName] = existingInfo
+		if _, exists := environmentInfos[envName]; !exists && relevantEnvironments[envName] {
+			environmentInfos[envName] = environmentInfo{}
 		}
 	}
 
@@ -1683,7 +1551,7 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 			if env.Spec.Environment == "" || env.Spec.Name != environment.Spec.Name {
 				continue
 			}
-			envName := env.Spec.Environment
+			envName, _ := wave.Canonical(env.Spec.Environment)
 			if !relevantEnvironments[envName] {
 				continue
 			}
@@ -1706,24 +1574,9 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 
 			// Re-fetch deployments after syncing to get the latest status
 			// Fetch all pages to ensure we get all deployments (not just the first page)
-			formattedEnv := formatDeploymentEnvironment(deploymentName, envName)
-			task := formatDeploymentTask(deploymentName)
-			allDeploymentsForEnv := make([]*github.Deployment, 0)
-			opts := &github.DeploymentsListOptions{
-				Task:        task,
-				Environment: formattedEnv,
-				ListOptions: github.ListOptions{PerPage: 100}, // Fetch up to 100 per page
-			}
-			for {
-				deployments, resp, err := ghClient.Repositories.ListDeployments(ctx, owner, repo, opts)
-				if err != nil {
-					break
-				}
-				allDeploymentsForEnv = append(allDeploymentsForEnv, deployments...)
-				if resp.NextPage == 0 {
-					break
-				}
-				opts.Page = resp.NextPage
+			allDeploymentsForEnv, err := r.listTierDeployments(ctx, ghClient, owner, repo, formatDeploymentTask(deploymentName), deploymentName, envName, false)
+			if err != nil {
+				allDeploymentsForEnv = nil
 			}
 			allDeploymentsForEnv = r.displayDeployments(ctx, ghClient, owner, repo, envName, allDeploymentsForEnv, ownSites)
 			envDeployments[envName] = allDeploymentsForEnv
@@ -1796,7 +1649,7 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 		}
 	}
 
-	return &relationshipGraphData{
+	return &environmentGraphData{
 		relevantEnvironments:  relevantEnvironments,
 		relevantVersions:      relevantVersions,
 		envDeployments:        envDeployments,
@@ -1806,143 +1659,50 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 	}, nil
 }
 
-// updateAllowedVersionsFromRelationships checks environment relationships and updates allowed versions on RolloutGate.
-// The related environment's history (synced from GitHub deployments) decides which versions pass,
-// depending on the relationship type (see relationshipAllowsBakeStatus).
-//
-// The gate is an allow list that the Rollout consults only when it picks its next version, which
-// has some consequences for "Alongside":
-//   - If the related environment's deployment of a version fails or is cancelled after this
-//     environment has started deploying it, the version drops out of the allow list, but this
-//     environment's deployment keeps going and is judged by its own bake and health checks.
-//   - Rollbacks on the related environment don't propagate. The Rollout only moves to release
-//     candidates newer than what it runs, so an older version being allowed changes nothing.
-func (r *GitHubEnvironmentReconciler) updateAllowedVersionsFromRelationships(ctx context.Context, environment *kuberikv1alpha1.Environment) error {
-	// Get the referenced Rollout to access releaseCandidates
-	rollout, err := r.getReferencedRollout(ctx, environment)
-	if err != nil {
-		return fmt.Errorf("failed to get referenced Rollout: %w", err)
+// directlyConnected reports whether tier envName is the current Environment's tier
+// or the nearest tier before or after it among the tiers present in infos.
+func directlyConnected(current, envName string, infos map[string]environmentInfo) bool {
+	cur, _ := wave.Canonical(current)
+	if envName == cur {
+		return true
 	}
-
-	// Build a map of revision -> tag from releaseCandidates
-	revisionToTag := make(map[string]string)
-	for _, candidate := range rollout.Status.ReleaseCandidates {
-		if candidate.Revision != nil && *candidate.Revision != "" && candidate.Tag != "" {
-			revisionToTag[*candidate.Revision] = candidate.Tag
+	rc, re := wave.Rank(cur), wave.Rank(envName)
+	if rc < 0 || re < 0 {
+		return false
+	}
+	lo, hi := min(rc, re), max(rc, re)
+	for name := range infos {
+		if r := wave.Rank(name); r > lo && r < hi {
+			return false
 		}
 	}
-
-	// Initialize as empty slice (not nil) when relationship is set
-	// This ensures allowedVersions is set to empty array instead of nil
-	allowedTags := []string{}
-	seenTags := make(map[string]bool) // Avoid duplicates
-
-	// Find allowed versions from related environment history
-	if environment.Spec.Relationship != nil {
-		relatedEnvName := environment.Spec.Relationship.Environment
-
-		// Find related environment info in Status
-		var relatedEnvInfo *kuberikv1alpha1.EnvironmentInfo
-		if environment.Status.EnvironmentInfos != nil {
-			for i := range environment.Status.EnvironmentInfos {
-				// Use 'info' to access the element without copying if possible, but range returns copy
-				if environment.Status.EnvironmentInfos[i].Environment == relatedEnvName {
-					relatedEnvInfo = &environment.Status.EnvironmentInfos[i]
-					break
-				}
-			}
-		}
-
-		// Check if related environment has history
-		if relatedEnvInfo != nil {
-			for _, entry := range relatedEnvInfo.History {
-				if entry.Version.Revision == nil || *entry.Version.Revision == "" {
-					continue
-				}
-				revision := *entry.Version.Revision
-
-				// Since we now have consolidated history in Status with latest bake status (from GitHub),
-				// checking the entry's BakeStatus is sufficient.
-				if relationshipAllowsBakeStatus(environment.Spec.Relationship.Type, entry.BakeStatus) {
-					// Match revision to tag in releaseCandidates
-					if tag, found := revisionToTag[revision]; found {
-						// Only add if not already seen
-						if !seenTags[tag] {
-							allowedTags = append(allowedTags, tag)
-							seenTags[tag] = true
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Update allowed versions on RolloutGate (only if relationship is set)
-	if environment.Spec.Relationship == nil {
-		// No relationship, skip RolloutGate update
-		return nil
-	} else if environment.Status.RolloutGateRef == nil {
-		return nil
-	} else {
-		rolloutGate := &kuberikrolloutv1alpha1.RolloutGate{}
-		err = r.Get(ctx, types.NamespacedName{
-			Name:      environment.Status.RolloutGateRef.Name,
-			Namespace: environment.Namespace,
-		}, rolloutGate)
-		if err != nil {
-			return fmt.Errorf("failed to get RolloutGate: %w", err)
-		}
-
-		// Check if allowedVersions need to be updated
-		// When dependencies are set, we must ensure allowedVersions is set to empty array instead of nil
-		needsUpdate := false
-		if rolloutGate.Spec.AllowedVersions == nil {
-			// If currently nil and dependencies are set, we need to set it to empty array
-			needsUpdate = true
-		} else {
-			// Compare current values with new values
-			currentAllowedVersions := *rolloutGate.Spec.AllowedVersions
-			if !r.slicesEqual(currentAllowedVersions, allowedTags) {
-				needsUpdate = true
-			}
-		}
-
-		if needsUpdate {
-			rolloutGate.Spec.AllowedVersions = &allowedTags
-			if err := r.Update(ctx, rolloutGate); err != nil {
-				return fmt.Errorf("failed to update RolloutGate allowedVersions: %w", err)
-			}
-		}
-	}
-
-	return nil
+	return true
 }
 
-// relationshipAllowsBakeStatus reports whether a version whose deployment on the related environment
-// has the given bake status may pass this environment's gate.
-func relationshipAllowsBakeStatus(relType kuberikv1alpha1.RelationshipType, bakeStatus *string) bool {
-	if bakeStatus == nil {
-		return false
-	}
-	switch relType {
-	case kuberikv1alpha1.RelationshipTypeAlongside:
-		// The related environment has started deploying the version and it hasn't failed there
-		switch *bakeStatus {
-		case kuberikrolloutv1alpha1.BakeStatusDeploying,
-			kuberikrolloutv1alpha1.BakeStatusInProgress,
-			kuberikrolloutv1alpha1.BakeStatusSucceeded:
-			return true
+// siteLessGateTags returns the tags of the revisions the (site-less) upstream tier baked
+// Succeeded, as found in this Environment's status.environmentInfos, matched to the
+// Rollout's release candidates. Only a bake that Succeeded counts.
+func siteLessGateTags(environment *kuberikv1alpha1.Environment, upstream string, rollout *kuberikrolloutv1alpha1.Rollout) []string {
+	revisionToTag := map[string]string{}
+	for _, cand := range rollout.Status.ReleaseCandidates {
+		if cand.Revision != nil && *cand.Revision != "" && cand.Tag != "" {
+			revisionToTag[*cand.Revision] = cand.Tag
 		}
-		return false
-	default:
-		// After, and any type this controller doesn't know (see normalizeRelationship)
-		return *bakeStatus == kuberikrolloutv1alpha1.BakeStatusSucceeded
 	}
+	tags := []string{}
+	seen := map[string]bool{}
+	for _, rev := range upstreamBakedRevisions(environment, upstream) {
+		if tag, ok := revisionToTag[rev]; ok && !seen[tag] {
+			seen[tag] = true
+			tags = append(tags, tag)
+		}
+	}
+	return tags
 }
 
 // updateEnvironmentInfoWithHistory updates or adds an EnvironmentInfo entry to the list
 // It ensures that history entries are sorted descending by ID
-func updateEnvironmentInfoWithHistory(infos []kuberikv1alpha1.EnvironmentInfo, environment, environmentURL string, relationship *kuberikv1alpha1.EnvironmentRelationship, history []kuberikrolloutv1alpha1.DeploymentHistoryEntry) []kuberikv1alpha1.EnvironmentInfo {
+func updateEnvironmentInfoWithHistory(infos []kuberikv1alpha1.EnvironmentInfo, environment, environmentURL string, history []kuberikrolloutv1alpha1.DeploymentHistoryEntry) []kuberikv1alpha1.EnvironmentInfo {
 	var historyCopy []kuberikrolloutv1alpha1.DeploymentHistoryEntry
 	if history != nil {
 		// Deep copy
@@ -1979,7 +1739,6 @@ func updateEnvironmentInfoWithHistory(infos []kuberikv1alpha1.EnvironmentInfo, e
 	for i := range infos {
 		if infos[i].Environment == environment {
 			infos[i].EnvironmentURL = environmentURL
-			infos[i].Relationship = relationship
 			if history != nil {
 				infos[i].History = historyCopy
 			}
@@ -1991,7 +1750,6 @@ func updateEnvironmentInfoWithHistory(infos []kuberikv1alpha1.EnvironmentInfo, e
 	infos = append(infos, kuberikv1alpha1.EnvironmentInfo{
 		Environment:    environment,
 		EnvironmentURL: environmentURL,
-		Relationship:   relationship,
 		History:        historyCopy,
 	})
 	return infos
@@ -2109,18 +1867,6 @@ func environmentInfosEqual(a, b []kuberikv1alpha1.EnvironmentInfo) bool {
 		if aEntry.EnvironmentURL != bEntry.EnvironmentURL {
 			return false
 		}
-		// Compare relationships
-		if (aEntry.Relationship == nil) != (bEntry.Relationship == nil) {
-			return false
-		}
-		if aEntry.Relationship != nil && bEntry.Relationship != nil {
-			if aEntry.Relationship.Environment != bEntry.Relationship.Environment {
-				return false
-			}
-			if aEntry.Relationship.Type != bEntry.Relationship.Type {
-				return false
-			}
-		}
 		// Compare history
 		if !historyEntriesEqual(aEntry.History, bEntry.History) {
 			return false
@@ -2191,4 +1937,10 @@ func (r *GitHubEnvironmentReconciler) addSiteToPayload(p *deploymentPayload, env
 	p.Wave = r.effectiveWave(env)
 	p.Lockstep = env.Spec.Lockstep
 	p.Selection = isWaveLeader(env, site)
+}
+
+// canonicalEnv is the canonical tier name of an environment name.
+func canonicalEnv(name string) string {
+	c, _ := wave.Canonical(name)
+	return c
 }

@@ -25,7 +25,7 @@ limitations under the License.
 // Vocabulary
 //
 //   - Environment: dev, staging, prod. Env-to-env ordering is the existing
-//     Relationship (After); this package only needs the upstream env name.
+//     tier order (dev, test, staging, prod); this package only needs the upstream env name.
 //   - Site: one cluster's instance of an environment (eu-west-1).
 //   - Wave: ordering of sites WITHIN one environment, 1-based, contiguous.
 //   - Member: a site registered in the backend for (environment, wave). A member
@@ -167,7 +167,7 @@ type Self struct {
 	Site        string
 	Wave        int32
 	Lockstep    bool
-	// Upstream is the Relationship (After) environment, "" when none.
+	// Upstream is the nearest earlier tier with registered sites, "" when none.
 	Upstream string
 	// PinnedVersion is the local Rollout's spec.wantedVersion ("" when not pinned).
 	PinnedVersion string
@@ -337,7 +337,7 @@ func decideFollower(d Decision, in Input, st waveState) Decision {
 		d.Blocker = &Blocker{Reason: ReasonWaitingForCandidate, Message: short(st.selRev)}
 		return d
 	}
-	// Same as Alongside: when the leader's bake of the selection failed or was
+	// Like the former Alongside: when the leader's bake of the selection failed or was
 	// cancelled the version drops out of the gate. A follower that already
 	// started it keeps going (the gate is an allow list).
 	for _, lm := range st.reg {

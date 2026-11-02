@@ -1,0 +1,171 @@
+Downloading github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.3.0
+/home/luka/projects/kuberik/.work/wt-waves-wiring/bin/golangci-lint run
+internal/controller/githubenvironment_controller_test.go:128:19: Error return value of `k8sClient.Delete` is not checked (errcheck)
+		k8sClient.Delete(context.Background(), secret)
+		                ^
+internal/controller/githubenvironment_controller_test.go:146:21: Error return value of `k8sClient.Delete` is not checked (errcheck)
+				k8sClient.Delete(context.Background(), &deploymentList.Items[i])
+				                ^
+internal/controller/githubenvironment_controller_test.go:159:14: Error return value of `os.Setenv` is not checked (errcheck)
+				os.Setenv("POD_NAMESPACE", "test-namespace")
+				         ^
+internal/controller/githubenvironment_controller_test.go:160:22: Error return value of `os.Unsetenv` is not checked (errcheck)
+				defer os.Unsetenv("POD_NAMESPACE")
+				                 ^
+internal/controller/githubenvironment_controller_test.go:166:16: Error return value of `os.Unsetenv` is not checked (errcheck)
+				os.Unsetenv("POD_NAMESPACE")
+				           ^
+internal/controller/githubenvironment_controller_test.go:167:16: Error return value of `os.Unsetenv` is not checked (errcheck)
+				os.Unsetenv("WATCH_NAMESPACE")
+				           ^
+internal/controller/githubenvironment_controller_test.go:184:14: Error return value of `os.Setenv` is not checked (errcheck)
+				os.Setenv("POD_NAMESPACE", ControllerNamespace)
+				         ^
+internal/controller/githubenvironment_controller_test.go:193:21: Error return value of `k8sClient.Create` is not checked (errcheck)
+				k8sClient.Create(context.Background(), ns)
+				                ^
+internal/controller/githubenvironment_controller_test.go:205:21: Error return value of `k8sClient.Delete` is not checked (errcheck)
+				k8sClient.Delete(context.Background(), svc)
+				                ^
+internal/controller/suite_test.go:68:12: Error return value of `os.Setenv` is not checked (errcheck)
+		os.Setenv("GITHUB_TOKEN", strings.TrimSpace(string(res)))
+		         ^
+internal/controller/githubenvironment_controller_test.go:1965:4: ginkgo-linter: wrong length assertion. Consider using `Expect(stagingInfo.History).ToNot(BeEmpty())` instead (ginkgolinter)
+			Expect(len(stagingInfo.History)).To(BeNumerically(">=", 1))
+			^
+internal/controller/githubenvironment_controller_test.go:2063:4: ginkgo-linter: wrong length assertion. Consider using `Expect(productionInfo.History).ToNot(BeEmpty())` instead (ginkgolinter)
+			Expect(len(productionInfo.History)).To(BeNumerically(">=", 1))
+			^
+internal/controller/githubenvironment_controller_test.go:2421:4: ginkgo-linter: wrong length assertion. Consider using `Expect(productionInfo.History).ToNot(BeEmpty())` instead (ginkgolinter)
+			Expect(len(productionInfo.History)).To(BeNumerically(">=", 1))
+			^
+internal/controller/githubenvironment_controller_test.go:2433:4: ginkgo-linter: wrong length assertion. Consider using `Expect(stagingInfo.History).ToNot(BeEmpty())` instead (ginkgolinter)
+			Expect(len(stagingInfo.History)).To(BeNumerically(">=", 1))
+			^
+internal/controller/githubenvironment_controller_test.go:2588:4: ginkgo-linter: wrong length assertion. Consider using `Expect(productionInfo.History).To(HaveLen(1))` instead (ginkgolinter)
+			Expect(len(productionInfo.History)).To(Equal(1))
+			^
+internal/controller/githubenvironment_controller_test.go:2602:4: ginkgo-linter: wrong length assertion. Consider using `Expect(stagingInfo.History).To(HaveLen(1))` instead (ginkgolinter)
+			Expect(len(stagingInfo.History)).To(Equal(1))
+			^
+internal/controller/githubenvironment_controller_test.go:2634:4: ginkgo-linter: wrong length assertion. Consider using `Expect(stagingInfo.History).To(HaveLen(1))` instead (ginkgolinter)
+			Expect(len(stagingInfo.History)).To(Equal(1))
+			^
+internal/controller/githubenvironment_controller_test.go:2780:4: ginkgo-linter: wrong length assertion. Consider using `Expect(stagingInfo.History).To(HaveLen(1))` instead (ginkgolinter)
+			Expect(len(stagingInfo.History)).To(Equal(1))
+			^
+internal/controller/githubenvironment_controller_test.go:3008:4: ginkgo-linter: wrong length assertion. Consider using `Expect(stagingInfo.History).ToNot(BeEmpty())` instead (ginkgolinter)
+			Expect(len(stagingInfo.History)).To(BeNumerically(">=", 1))
+			^
+internal/controller/githubenvironment_controller_test.go:3019:5: ginkgo-linter: wrong length assertion. Consider using `Expect(qaInfo.History).To(BeEmpty(), "qa environment should not be tracked as it's not related")` instead (ginkgolinter)
+				Expect(len(qaInfo.History)).To(Equal(0), "qa environment should not be tracked as it's not related")
+				^
+internal/controller/githubenvironment_controller_test.go:3500:3: ginkgo-linter: wrong length assertion. Consider using `Expect(stagingInfo.History).To(HaveLen(originalStagingHistoryCount), "staging history should be preserved")` instead (ginkgolinter)
+		Expect(len(stagingInfo.History)).To(Equal(originalStagingHistoryCount), "staging history should be preserved")
+		^
+internal/controller/githubenvironment_controller_unit_test.go:249:4: ginkgo-linter: wrong length assertion. Consider using `Expect(devHistory).To(HaveLen(2))` instead (ginkgolinter)
+			Expect(len(devHistory)).To(Equal(2))
+			^
+internal/controller/githubenvironment_controller_unit_test.go:254:4: ginkgo-linter: wrong length assertion. Consider using `Expect(stagingHistory).To(HaveLen(2))` instead (ginkgolinter)
+			Expect(len(stagingHistory)).To(Equal(2))
+			^
+internal/controller/githubenvironment_controller_unit_test.go:295:4: ginkgo-linter: wrong length assertion. Consider using `Expect(relevantVersions).To(HaveLen(1))` instead (ginkgolinter)
+			Expect(len(relevantVersions)).To(Equal(1))
+			^
+internal/controller/githubenvironment_controller_unit_test.go:399:6: ginkgo-linter: wrong length assertion. Consider using `Expect(info.History).To(HaveLen(1))` instead (ginkgolinter)
+					Expect(len(info.History)).To(Equal(1))
+					^
+internal/controller/githubenvironment_controller_unit_test.go:470:4: ginkgo-linter: wrong length assertion. Consider using `Expect(environment.Status.EnvironmentInfos).To(HaveLen(3))` instead (ginkgolinter)
+			Expect(len(environment.Status.EnvironmentInfos)).To(Equal(3))
+			^
+internal/controller/githubenvironment_controller_unit_test.go:485:4: ginkgo-linter: wrong length assertion. Consider using `Expect(result).To(HaveLen(1))` instead (ginkgolinter)
+			Expect(len(result)).To(Equal(1))
+			^
+internal/controller/githubenvironment_controller_unit_test.go:576:4: ginkgo-linter: wrong length assertion. Consider using `Expect(infos).To(HaveLen(1))` instead (ginkgolinter)
+			Expect(len(infos)).To(Equal(1))
+			^
+internal/controller/githubenvironment_controller_unit_test.go:577:4: ginkgo-linter: wrong length assertion. Consider using `Expect(infos[0].History).To(HaveLen(3))` instead (ginkgolinter)
+			Expect(len(infos[0].History)).To(Equal(3))
+			^
+internal/controller/githubenvironment_controller_unit_test.go:600:4: ginkgo-linter: wrong length assertion. Consider using `Expect(infos).To(HaveLen(1))` instead (ginkgolinter)
+			Expect(len(infos)).To(Equal(1))
+			^
+internal/controller/githubenvironment_controller_unit_test.go:602:4: ginkgo-linter: wrong length assertion. Consider using `Expect(infos[0].History).To(HaveLen(2))` instead (ginkgolinter)
+			Expect(len(infos[0].History)).To(Equal(2))
+			^
+internal/controller/githubenvironment_controller_unit_test.go:638:4: ginkgo-linter: wrong length assertion. Consider using `Expect(environment.Status.EnvironmentInfos).To(HaveLen(3))` instead (ginkgolinter)
+			Expect(len(environment.Status.EnvironmentInfos)).To(Equal(3))
+			^
+internal/controller/fake_github_test.go:102:16: string `success` has 7 occurrences, make it a constant (goconst)
+	if s.State == "success" && (s.AutoInactive == nil || *s.AutoInactive) {
+	              ^
+internal/controller/githubenvironment_controller.go:628:16: string `https` has 3 occurrences, make it a constant (goconst)
+					scheme := "https"
+					          ^
+internal/controller/githubenvironment_controller.go:630:16: string `http` has 3 occurrences, make it a constant (goconst)
+						scheme = "http"
+						         ^
+internal/controller/githubenvironment_controller.go:1035:18: string `Deploying` has 3 occurrences, make it a constant (goconst)
+		statusPrefix = "Deploying"
+		               ^
+internal/controller/githubenvironment_controller.go:1037:13: string `inactive` has 4 occurrences, make it a constant (goconst)
+		ghState = "inactive"
+		          ^
+internal/controller/githubenvironment_controller_test.go:997:28: string `production` has 11 occurrences, make it a constant (goconst)
+				if info.Environment == "production" {
+				                       ^
+internal/controller/githubenvironment_controller_test.go:1721:17: string `8bd1ffbf07d9f04b9aba8757303a0f4c328c1743` has 5 occurrences, make it a constant (goconst)
+			revision2 := "8bd1ffbf07d9f04b9aba8757303a0f4c328c1743"
+			             ^
+internal/controller/githubenvironment_controller_unit_test.go:52:16: string `0a9c600d3a75bcb7ec54dcef3b03e0d7fe0598d7` has 22 occurrences, make it a constant (goconst)
+			revision := "0a9c600d3a75bcb7ec54dcef3b03e0d7fe0598d7"
+			            ^
+internal/controller/githubenvironment_controller_unit_test.go:394:28: string `staging` has 12 occurrences, make it a constant (goconst)
+				if info.Environment == "staging" {
+				                       ^
+internal/controller/githubenvironment_controller.go:593:1: cyclomatic complexity 50 of func `(*GitHubEnvironmentReconciler).getRolloutDashboardURL` is high (> 30) (gocyclo)
+func (r *GitHubEnvironmentReconciler) getRolloutDashboardURL(ctx context.Context, deploymentNamespace, deploymentName string) string {
+^
+internal/controller/githubenvironment_controller.go:852:1: cyclomatic complexity 34 of func `(*GitHubEnvironmentReconciler).syncDeploymentHistory` is high (> 30) (gocyclo)
+func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context, gh *github.Client, environment *kuberikv1alpha1.Environment, rollout *kuberikrolloutv1alpha1.Rollout) error {
+^
+internal/controller/githubenvironment_controller.go:1290:1: cyclomatic complexity 32 of func `(*GitHubEnvironmentReconciler).createOrUpdateRolloutGate` is high (> 30) (gocyclo)
+func (r *GitHubEnvironmentReconciler) createOrUpdateRolloutGate(ctx context.Context, environment *kuberikv1alpha1.Environment) error {
+^
+internal/controller/githubenvironment_controller.go:1430:1: cyclomatic complexity 66 of func `(*GitHubEnvironmentReconciler).buildRelationshipGraph` is high (> 30) (gocyclo)
+func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context, environment *kuberikv1alpha1.Environment, ghClient *github.Client) (*relationshipGraphData, error) {
+^
+internal/controller/githubenvironment_controller.go:1914:1: cyclomatic complexity 33 of func `historyEntriesEqual` is high (> 30) (gocyclo)
+func historyEntriesEqual(a, b []kuberikrolloutv1alpha1.DeploymentHistoryEntry) bool {
+^
+internal/controller/githubenvironment_controller.go:111:2: import-shadowing: The name 'log' shadows an import name (revive)
+	log := log.FromContext(ctx)
+	^
+internal/controller/githubenvironment_controller.go:318:83: import-shadowing: The name 'client' shadows an import name (revive)
+func (r *GitHubEnvironmentReconciler) createDeploymentStatus(ctx context.Context, client *github.Client, environment *kuberikv1alpha1.Environment, deploymentID int64, state string, description string) error {
+                                                                                  ^
+internal/controller/githubenvironment_controller.go:324:90: import-shadowing: The name 'client' shadows an import name (revive)
+func (r *GitHubEnvironmentReconciler) createDeploymentStatusWithURL(ctx context.Context, client *github.Client, environment *kuberikv1alpha1.Environment, deploymentID int64, state string, description string, withURL bool) error {
+                                                                                         ^
+internal/controller/githubenvironment_controller.go:407:2: QF1007: could merge conditional assignment into variable declaration (staticcheck)
+	needsUpdate := false
+	^
+internal/controller/githubenvironment_controller_test.go:89:5: SA9003: empty branch (staticcheck)
+				if err != nil {
+				^
+internal/controller/waves_test.go:110:40: init$5$4 - bake always receives "Succeeded" (unparam)
+	histEntry := func(id int64, rev, tag, bake string) kuberikrolloutv1alpha1.DeploymentHistoryEntry {
+	                                      ^
+internal/controller/fake_github_test.go:113:22: func (*fakeGitHub).dep is unused (unused)
+func (f *fakeGitHub) dep(id int64) fakeDep {
+                     ^
+53 issues:
+* errcheck: 10
+* ginkgolinter: 22
+* goconst: 9
+* gocyclo: 5
+* revive: 3
+* staticcheck: 2
+* unparam: 1
+* unused: 1
+make: *** [Makefile:95: lint] Error 1

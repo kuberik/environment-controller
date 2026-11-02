@@ -90,7 +90,6 @@ var _ = Describe("Sites and waves", func() {
 		return id
 	}
 
-
 	mkRollout := func(history ...kuberikrolloutv1alpha1.DeploymentHistoryEntry) *kuberikrolloutv1alpha1.Rollout {
 		ro := &kuberikrolloutv1alpha1.Rollout{
 			ObjectMeta: metav1.ObjectMeta{Name: "rollout", Namespace: ns},

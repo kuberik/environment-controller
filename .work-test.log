@@ -1,0 +1,13 @@
+/home/luka/projects/kuberik/.work/wt-waves-wiring/bin/controller-gen rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+/home/luka/projects/kuberik/.work/wt-waves-wiring/bin/controller-gen object:headerFile="hack/boilerplate.go.txt" paths="./..."
+go fmt ./...
+internal/controller/waves_test.go
+go vet ./...
+Downloading sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.22
+Setting up envtest binaries for Kubernetes version 1.34...
+/home/luka/projects/kuberik/.work/wt-waves-wiring/bin/k8s/1.34.1-linux-amd64KUBEBUILDER_ASSETS="/home/luka/projects/kuberik/.work/wt-waves-wiring/bin/k8s/1.34.1-linux-amd64" go test $(go list ./... | grep -v /e2e) -coverprofile cover.out
+	github.com/kuberik/environment-controller/api/v1alpha1		coverage: 0.0% of statements
+	github.com/kuberik/environment-controller/cmd		coverage: 0.0% of statements
+ok  	github.com/kuberik/environment-controller/internal/controller	110.719s	coverage: 79.2% of statements
+ok  	github.com/kuberik/environment-controller/internal/wave	0.004s	coverage: 97.3% of statements
+	github.com/kuberik/environment-controller/test/utils		coverage: 0.0% of statements

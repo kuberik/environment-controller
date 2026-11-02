@@ -304,6 +304,7 @@ func (r *GitHubEnvironmentReconciler) readMembers(ctx context.Context, gh *githu
 				}
 				m.Deployments = append(m.Deployments, wave.Deployment{
 					Revision:  *p.Version.Revision,
+					Wave:      max(p.Wave, 1),
 					Selection: p.Selection,
 					Bake:      bakeOf(statuses),
 					Order:     d.GetID(),

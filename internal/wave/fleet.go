@@ -28,34 +28,58 @@ import (
 type fleet struct {
 	env    string
 	byWave map[int32][]Member
+	// unseenSelf is Self's site when the backend does not count it yet.
+	unseenSelf string
 }
 
-// selfMember builds Self as a registered member of its spec wave, keeping the
-// deployments recorded for it in the backend.
-func selfMember(in Input) *Member {
+// selfMember builds Self as a member of its spec wave, keeping the deployments
+// recorded for it in the backend (stamped with the wave they were recorded in).
+// registered reports whether the backend already counts Self as a member.
+func selfMember(in Input) (self *Member, registered bool) {
 	s := in.Self
 	m := Member{Environment: s.Environment, Site: s.Site, Wave: s.Wave, Lockstep: s.Lockstep}
 	for _, o := range in.Members {
 		if o.Environment == s.Environment && o.Site == s.Site {
-			m.Deployments = o.Deployments
+			m.Deployments = stampWave(o.Deployments, o.Wave)
+			registered = !o.Deregistered
 			break
 		}
 	}
-	return &m
+	return &m, registered
 }
 
-func newFleet(env string, members []Member, self *Member) fleet {
+// stampWave returns deps with an unknown (0) Wave replaced by the member's
+// recorded wave.
+func stampWave(deps []Deployment, wave int32) []Deployment {
+	out := make([]Deployment, len(deps))
+	for i, d := range deps {
+		if d.Wave == 0 {
+			d.Wave = wave
+		}
+		out[i] = d
+	}
+	return out
+}
+
+// newFleet groups the members of env by wave. self, when given, replaces any
+// recorded entry for its site; selfRegistered says whether the backend
+// already sees it (an unseen Self may not out-rank registered members).
+func newFleet(env string, members []Member, self *Member, selfRegistered bool) fleet {
 	f := fleet{env: env, byWave: map[int32][]Member{}}
 	seen := map[string]bool{}
 	if self != nil {
 		seen[self.Site] = true
 		f.byWave[self.Wave] = append(f.byWave[self.Wave], *self)
+		if !selfRegistered {
+			f.unseenSelf = self.Site
+		}
 	}
 	for _, m := range members {
 		if m.Environment != env || seen[m.Site] {
 			continue
 		}
 		seen[m.Site] = true
+		m.Deployments = stampWave(m.Deployments, m.Wave)
 		f.byWave[m.Wave] = append(f.byWave[m.Wave], m)
 	}
 	return f
@@ -125,7 +149,8 @@ func (f fleet) topology() *Blocker {
 // deployment's Order. ok is false when the member never deployed rev.
 func bakeOf(m Member, rev string) (bake string, order int64, ok bool) {
 	for _, d := range m.Deployments {
-		if d.Revision == rev && (!ok || d.Order > order) {
+		// Equal Order (illegal duplicate input): the non-Succeeded copy wins.
+		if d.Revision == rev && (!ok || d.Order > order || (d.Order == order && d.Bake != BakeSucceeded)) {
 			bake, order, ok = d.Bake, d.Order, true
 		}
 	}
@@ -223,26 +248,58 @@ func (f fleet) state(w int32) waveState {
 	var selOrder int64
 	for _, m := range all {
 		for _, d := range m.Deployments {
-			if d.Selection && (!st.explicit || d.Order > selOrder) {
+			if !d.Selection || d.Wave != w {
+				continue
+			}
+			if !st.explicit || d.Order > selOrder || (d.Order == selOrder && m.Site < selSite) {
 				st.explicit, selOrder, st.selRev, selSite = true, d.Order, d.Revision, m.Site
 			}
 		}
 	}
+	// Selection records written in this wave by members that have since moved
+	// to another wave still count (deregistered members' records count too).
+	for ow, ms := range f.byWave {
+		if ow == w {
+			continue
+		}
+		for _, m := range ms {
+			for _, d := range m.Deployments {
+				if d.Selection && d.Wave == w && (!st.explicit || d.Order > selOrder || (d.Order == selOrder && m.Site < selSite)) {
+					st.explicit, selOrder, st.selRev, selSite = true, d.Order, d.Revision, m.Site
+				}
+			}
+		}
+	}
 	st.leader = st.reg[0].Site
+	if st.reg[0].Site == f.unseenSelf && len(st.reg) > 1 {
+		st.leader = st.reg[1].Site
+	}
 	if st.explicit {
 		for _, m := range st.reg {
-			if m.Site == selSite && !allBaked(st.reg, st.selRev) {
+			if m.Site == selSite && m.Site != f.unseenSelf && !allBaked(st.reg, st.selRev) {
 				st.leader = selSite
 			}
 		}
 		return st
 	}
-	// Implicit selection: the computed leader's newest deployment.
+	// Implicit selection: the computed leader's newest deployment. In waves
+	// after the first it only counts once the previous wave completed it, so
+	// a migration cannot leak an ungated revision into a later wave.
 	var newest Deployment
 	found := false
-	for _, d := range st.reg[0].Deployments {
-		if !found || d.Order > newest.Order {
-			newest, found = d, true
+	for _, m := range st.reg {
+		if m.Site != st.leader {
+			continue
+		}
+		for _, d := range m.Deployments {
+			if !found || d.Order > newest.Order {
+				newest, found = d, true
+			}
+		}
+	}
+	if found && w > 1 {
+		if _, done := completedRevs(f.state(w - 1).reg)[newest.Revision]; !done {
+			found = false
 		}
 	}
 	if found {

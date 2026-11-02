@@ -70,7 +70,7 @@ func TestDecide(t *testing.T) {
 		},
 		{
 			name: "lowest site leads, unrestricted without upstream",
-			in:   Input{Self: self("a", 1), Members: []Member{m("prod", "b", 1)}},
+			in:   Input{Self: self("a", 1), Members: []Member{m("prod", "a", 1), m("prod", "b", 1)}},
 			role: RoleLeader, leader: "a", unrestr: true,
 		},
 		{
@@ -272,7 +272,7 @@ func TestDecide(t *testing.T) {
 		{
 			name: "lockstep mismatch (self is leader)",
 			in: Input{Self: Self{Environment: "prod", Site: "a", Wave: 1, Lockstep: true},
-				Members: []Member{m("prod", "b", 1), m("prod", "c", 2), lock(m("prod", "d", 2))}},
+				Members: []Member{m("prod", "a", 1), m("prod", "b", 1), m("prod", "c", 2), lock(m("prod", "d", 2))}},
 			role: RoleLeader, leader: "a", unrestr: true, mismatch: true,
 		},
 		{
@@ -361,7 +361,7 @@ func TestDecide(t *testing.T) {
 
 func TestMismatchMessage(t *testing.T) {
 	got := Decide(Input{Self: Self{Environment: "prod", Site: "a", Wave: 1, Lockstep: true},
-		Members: []Member{m("prod", "b", 1), lock(m("prod", "c", 2)), m("prod", "d", 2)}})
+		Members: []Member{m("prod", "a", 1), m("prod", "b", 1), lock(m("prod", "c", 2)), m("prod", "d", 2)}})
 	want := "wave-1 leader prod/a has lockstep=true; disagreeing sites: prod/b, prod/d"
 	if got.Mismatch == nil || got.Mismatch.Message != want {
 		t.Fatalf("mismatch = %+v, want %q", got.Mismatch, want)

@@ -45,10 +45,17 @@ limitations under the License.
 //     successfully), the recorded leader stays leader. A lower-sorting site that
 //     registers mid-flight does not take over.
 //  3. Otherwise the leader is the lexicographically lowest registered site of the
-//     wave (self is always counted, registered or not).
+//     wave. Self always counts for completion and topology, but a Self that is
+//     not registered in the backend (no deployments yet, or deregistered) is
+//     only eligible to lead when no other registered member exists in its wave:
+//     the other members cannot see it yet, so it must not out-rank them.
 //  4. If no selection record exists at all in (env, wave) (fresh fleet, or a
 //     fleet migrating from site-less), the computed leader's newest deployment
-//     acts as the implicit selection, so followers have something to follow.
+//     acts as the implicit selection, so followers have something to follow. In
+//     waves N>1 the implicit selection only counts when wave N-1 completed it.
+//
+// Selection records count only for the wave recorded on the deployment
+// (Deployment.Wave), never for the member's current wave.
 //
 // Allowed versions
 //
@@ -66,7 +73,11 @@ limitations under the License.
 // Lockstep: if the wave-1 leader's own spec has Lockstep and the current wave-1
 // selection is not yet baked Succeeded by every registered member of every wave
 // of the environment, the leader's allowed set is pinned to the current
-// selection (LockstepWaiting).
+// selection (LockstepWaiting). Consequences an operator must know: a failed
+// bake in any wave holds the whole environment on the failed revision, and if
+// the selected revision drops out of the leader's releaseCandidates the leader
+// stays blocked until it returns. Both are released by turning lockstep off or
+// pinning the leader's Rollout.
 //
 // Topology: the waves present in an environment (registered members plus self)
 // must be exactly 1..max. A gap blocks everything (empty allowed set,
@@ -117,9 +128,16 @@ type Deployment struct {
 	// Order is a strictly increasing backend ordering (GitHub deployment ID).
 	// Larger is newer. Orders are comparable across members of one repository.
 	Order int64
+	// Wave the member was in when it created this deployment (payload "wave").
+	// A selection record only counts for the wave it was written in, so a site
+	// that moves from wave 1 to wave 2 does not carry its wave-1 pick along.
+	// 0 means unknown and is read as the member's recorded Wave.
+	Wave int32
 }
 
-// Member is one site of one environment as seen in the backend.
+// Member is one site of one environment as seen in the backend. Input must
+// carry at most one Member per (Environment, Site); duplicates are illegal
+// input (the first one wins).
 type Member struct {
 	Environment string
 	Site        string
@@ -202,7 +220,8 @@ type Decision struct {
 // Decide computes Self's role and gate. Pure; see the package doc for the rules.
 func Decide(in Input) Decision {
 	s := in.Self
-	own := newFleet(s.Environment, in.Members, selfMember(in))
+	sm, selfRegistered := selfMember(in)
+	own := newFleet(s.Environment, in.Members, sm, selfRegistered)
 	st := own.state(s.Wave)
 
 	d := Decision{
@@ -222,10 +241,14 @@ func Decide(in Input) Decision {
 	// DECISION: an upstream wave gap blocks every role, followers included,
 	// because the contract says it takes precedence over everything.
 	var up fleet
-	hasUpstream := s.Upstream != "" && s.Upstream != s.Environment
+	if s.Upstream != "" && s.Upstream == s.Environment {
+		return blocked(d, &Blocker{Reason: ReasonInvalidTopology,
+			Message: s.Environment + " is its own upstream"})
+	}
+	hasUpstream := s.Upstream != ""
 	sitedUpstream := hasUpstream && !in.UpstreamSiteless
 	if sitedUpstream {
-		up = newFleet(s.Upstream, in.Members, nil)
+		up = newFleet(s.Upstream, in.Members, nil, false)
 		if b := up.topology(); b != nil {
 			return blocked(d, b)
 		}
@@ -311,7 +334,7 @@ func decideFollower(d Decision, in Input, st waveState) Decision {
 // Used directly by site-less Environments whose upstream is sited.
 // Revisions are ordered newest first (ties by revision).
 func UpstreamComplete(env string, members []Member) ([]string, *Blocker) {
-	f := newFleet(env, members, nil)
+	f := newFleet(env, members, nil, false)
 	if b := f.topology(); b != nil {
 		return nil, b
 	}

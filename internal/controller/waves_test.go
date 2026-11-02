@@ -375,13 +375,254 @@ var _ = Describe("Sites and waves", func() {
 	It("fetches each deployment's statuses at most once per reconcile", func() {
 		seed(prodGH, "us-east-1", 1, false, wRevA, "v1", "Succeeded")
 		seed(prodGH, "eu-west-1", 1, true, wRevA, "v1", "Succeeded")
+		seed(stagGH, "stg", 1, false, wRevA, "v1", "Succeeded")
 		mkRollout()
-		e := mkEnv("ap", "ap-south-1", k8sptr.To(int32(2)), false)
+		e := mkEnv("ap", "ap-south-1", k8sptr.To(int32(2)), true)
 		reconcile(e)
-		// 2 seeded deployments; each status list is requested once per reconcile
-		// (page size 100 => one call each), though history building and the wave
-		// reader both need them.
-		Expect(fake.countCalls("GET /repos/o/r/deployments/")).To(BeNumerically("<=", 2*2))
+		counts := fake.statusListCalls()
+		Expect(counts).To(HaveLen(3)) // every seeded deployment was read
+		for id, n := range counts {
+			Expect(n).To(Equal(1), "statuses of deployment %s fetched %d times", id, n)
+		}
+		// payloads are readable in list responses: no per-deployment GetDeployment
+		Expect(fake.getDeploymentCalls()).To(BeZero())
+	})
+
+	Describe("history display with deregistered sites", func() {
+		It("follows newer site-less deployments once every upstream site is deregistered", func() {
+			stg := seed(stagGH, "stg", 1, false, wRevA, "v1", "Succeeded")
+			fake.addStatus(stg, "inactive", "Deregistered: site stg removed")
+			seed(stagGH, "", 0, false, wRevA, "v1", "Succeeded")
+			seed(stagGH, "", 0, false, wRevB, "v2", "Succeeded")
+			mkRollout()
+			e := mkEnv("plain", "", nil, true)
+			reconcile(e)
+			Expect(*gateAllowed(e)).To(ConsistOf("v1", "v2"))
+		})
+
+		It("shows a live site-less cluster beside deregistered sited ones", func() {
+			seed(stagGH, "stg", 1, false, wRevA, "v1", "Succeeded")
+			stgB := seed(stagGH, "stg", 1, false, wRevB, "v2", "Succeeded")
+			fake.addStatus(stgB, "inactive", "Deregistered: site stg removed")
+			seed(stagGH, "", 0, false, wRevC, "v3", "Succeeded")
+			mkRollout()
+			e := mkEnv("plain", "", nil, true)
+			reconcile(e)
+			Expect(*gateAllowed(e)).To(ConsistOf("v3"))
+		})
+	})
+
+	Describe("registration identity", func() {
+		lastStatus := func(d fakeDep) fakeStatus { return d.Statuses[len(d.Statuses)-1] }
+		sitePayload := func(d fakeDep) string {
+			var p map[string]any
+			_ = json.Unmarshal(decodedPayload(d.Payload), &p)
+			s, _ := p["site"].(string)
+			return s
+		}
+
+		It("deregisters the old site when the site changes", func() {
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", "eu-west-1", nil, false)
+			reconcile(e)
+			Expect(get(e).Status.Wave.Environment).To(Equal("prod"))
+			Expect(get(e).Status.Wave.Name).To(Equal("kuberik/" + wApp))
+
+			cur := get(e)
+			cur.Spec.Site = "us-east-1"
+			Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+			reconcile(e)
+
+			var eu, us *fakeDep
+			for _, d := range fake.deploymentsOf(prodGH) {
+				switch sitePayload(d) {
+				case "eu-west-1":
+					eu = &d
+				case "us-east-1":
+					us = &d
+				}
+			}
+			Expect(eu).NotTo(BeNil())
+			Expect(us).NotTo(BeNil())
+			Expect(lastStatus(*eu).Description).To(Equal("Deregistered: site eu-west-1 removed"))
+			Expect(*lastStatus(*eu).AutoInactive).To(BeFalse())
+			Expect(lastStatus(*us).Description).NotTo(HavePrefix("Deregistered"))
+			Expect(get(e).Status.Wave.Site).To(Equal("us-east-1"))
+		})
+
+		It("deregisters the old environment's member when spec.environment changes", func() {
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", "eu-west-1", nil, false)
+			reconcile(e)
+
+			cur := get(e)
+			cur.Spec.Environment = "prod2"
+			Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+			reconcile(e)
+
+			old := fake.deploymentsOf(prodGH)
+			Expect(old).To(HaveLen(1))
+			Expect(lastStatus(old[0]).Description).To(Equal("Deregistered: site eu-west-1 removed"))
+			fresh := fake.deploymentsOf("kuberik/" + wApp + "/prod2")
+			Expect(fresh).To(HaveLen(1))
+			Expect(lastStatus(fresh[0]).Description).NotTo(HavePrefix("Deregistered"))
+			Expect(get(e).Status.Wave.Environment).To(Equal("prod2"))
+		})
+
+		It("deregisters, releases the finalizer and clears wave state when the site is removed", func() {
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", "eu-west-1", nil, false)
+			reconcile(e)
+			Expect(cond(e, ConditionWaveReady)).NotTo(BeNil())
+
+			cur := get(e)
+			cur.Spec.Site = ""
+			Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+			reconcile(e)
+
+			cur = get(e)
+			Expect(controllerutil.ContainsFinalizer(cur, DeregisterFinalizer)).To(BeFalse())
+			Expect(cur.Status.Wave).To(BeNil())
+			Expect(cond(e, ConditionWaveReady)).To(BeNil())
+			Expect(cond(e, ConditionLockstepConsistent)).To(BeNil())
+			deps := fake.deploymentsOf(prodGH)
+			var eu *fakeDep
+			for _, d := range deps {
+				if sitePayload(d) == "eu-west-1" {
+					eu = &d
+				}
+			}
+			Expect(eu).NotTo(BeNil())
+			// The site-less status that follows may append GitHub's automatic inactive
+			// status after the marker, so look for the marker itself.
+			var marker *fakeStatus
+			for _, st := range eu.Statuses {
+				if st.Description == "Deregistered: site eu-west-1 removed" {
+					marker = &st
+				}
+			}
+			Expect(marker).NotTo(BeNil())
+			Expect(marker.AutoInactive).NotTo(BeNil())
+			Expect(*marker.AutoInactive).To(BeFalse()) // even though the Environment is site-less now
+		})
+
+		It("re-registers a recreated Environment and other members see it again", func() {
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", "eu-west-1", nil, false)
+			reconcile(e)
+			ap := mkEnv("ap", "ap-south-1", k8sptr.To(int32(2)), false)
+			member := func() *kuberikv1alpha1.WaveMemberStatus {
+				reconcile(ap)
+				for _, m := range get(ap).Status.Wave.Members {
+					if m.Site == "eu-west-1" {
+						return &m
+					}
+				}
+				return nil
+			}
+			Expect(member()).NotTo(BeNil())
+			Expect(member().Deregistered).To(BeFalse())
+
+			Expect(k8sClient.Delete(ctx, get(e))).To(Succeed())
+			reconcile(e)
+			Expect(member().Deregistered).To(BeTrue())
+
+			mkEnv("eu", "eu-west-1", nil, false)
+			reconcile(e)
+			var eu fakeDep
+			for _, d := range fake.deploymentsOf(prodGH) {
+				if sitePayload(d) == "eu-west-1" {
+					eu = d
+				}
+			}
+			Expect(lastStatus(eu).Description).NotTo(HavePrefix("Deregistered"))
+			Expect(lastStatus(eu).State).To(Equal(stateSuccess))
+			Expect(member().Deregistered).To(BeFalse())
+		})
+
+		It("gives up deregistration when the namespace is terminating and the token Secret is gone", func() {
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", "eu-west-1", nil, false)
+			reconcile(e)
+			before := fake.callCount()
+
+			sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github-token", Namespace: ns}}
+			Expect(k8sClient.Delete(ctx, sec)).To(Succeed())
+			// envtest runs no namespace controller: the namespace stays Terminating.
+			Expect(k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			Expect(k8sClient.Delete(ctx, get(e))).To(Succeed())
+			reconcile(e)
+
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: e.Name, Namespace: ns}, &kuberikv1alpha1.Environment{}))).To(BeTrue())
+			Expect(fake.callCount()).To(Equal(before))
+		})
+
+		It("keeps retrying deregistration when the Secret is gone but the namespace is not terminating", func() {
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", "eu-west-1", nil, false)
+			reconcile(e)
+			Expect(k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github-token", Namespace: ns}})).To(Succeed())
+			Expect(k8sClient.Delete(ctx, get(e))).To(Succeed())
+			_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: e.Name, Namespace: ns}})
+			Expect(err).To(HaveOccurred())
+			Expect(controllerutil.ContainsFinalizer(get(e), DeregisterFinalizer)).To(BeTrue())
+		})
+
+		It("posts the marker on OUR newest deployment when other sites have newer ones", func() {
+			mkRollout(histEntry(1, wRevA, "v1"))
+			e := mkEnv("eu", "eu-west-1", nil, false)
+			reconcile(e)
+			ro := &kuberikrolloutv1alpha1.Rollout{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rollout", Namespace: ns}, ro)).To(Succeed())
+			ro.Status.History = append([]kuberikrolloutv1alpha1.DeploymentHistoryEntry{histEntry(2, wRevB, "v2")}, ro.Status.History...)
+			Expect(k8sClient.Status().Update(ctx, ro)).To(Succeed())
+			reconcile(e)
+			usID := seed(prodGH, "us-east-1", 1, false, wRevB, "v2", "Succeeded")
+
+			Expect(k8sClient.Delete(ctx, get(e))).To(Succeed())
+			reconcile(e)
+
+			var euDeps []fakeDep
+			for _, d := range fake.deploymentsOf(prodGH) {
+				switch {
+				case d.ID == usID:
+					Expect(lastStatus(d).Description).NotTo(HavePrefix("Deregistered"))
+				case sitePayload(d) == "eu-west-1":
+					euDeps = append(euDeps, d)
+				}
+			}
+			Expect(euDeps).To(HaveLen(2))
+			Expect(lastStatus(euDeps[0]).Description).NotTo(HavePrefix("Deregistered"))
+			Expect(lastStatus(euDeps[1]).Description).To(Equal("Deregistered: site eu-west-1 removed"))
+		})
+	})
+
+	Describe("site-less Environment with a sited upstream", func() {
+		It("uses only the last wave for upstream completion", func() {
+			seed(stagGH, "stg1", 1, false, wRevA, "v1", "Succeeded")
+			seed(stagGH, "stg1", 1, false, wRevB, "v2", "Succeeded")
+			seed(stagGH, "stg2", 2, false, wRevA, "v1", "Succeeded")
+			seed(stagGH, "stg2", 2, false, wRevB, "v2", "InProgress")
+			mkRollout()
+			e := mkEnv("plain", "", nil, true)
+			reconcile(e)
+			Expect(*gateAllowed(e)).To(ConsistOf("v1"))
+		})
+
+		It("excludes a deregistered member from completion", func() {
+			seed(stagGH, "stg1", 1, false, wRevA, "v1", "Succeeded")
+			seed(stagGH, "stg1", 1, false, wRevB, "v2", "Succeeded")
+			seed(stagGH, "stg2", 1, false, wRevA, "v1", "Succeeded")
+			b := seed(stagGH, "stg2", 1, false, wRevB, "v2", "InProgress")
+			mkRollout()
+			e := mkEnv("plain", "", nil, true)
+			reconcile(e)
+			Expect(*gateAllowed(e)).To(ConsistOf("v1"))
+
+			fake.addStatus(b, "inactive", "Deregistered: site stg2 removed")
+			reconcile(e)
+			Expect(*gateAllowed(e)).To(ConsistOf("v1", "v2"))
+		})
 	})
 })
 

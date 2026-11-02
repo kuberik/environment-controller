@@ -364,10 +364,7 @@ func (r *GitHubEnvironmentReconciler) createDeploymentStatusWithURL(ctx context.
 
 	// Get rollout-dashboard URL from ingress/gateway in controller's namespace
 	// The URL will include the path /rollouts/<namespace>/<name>
-	environmentURL := ""
-	if withURL {
-		environmentURL = r.getRolloutDashboardURL(ctx, environment.Namespace, environment.Name)
-	}
+	environmentURL := r.getRolloutDashboardURL(ctx, environment.Namespace, environment.Name)
 
 	// Create deployment status request
 	statusRequest := &github.DeploymentStatusRequest{
@@ -968,15 +965,20 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 					continue
 				}
 
-				// Try to extract key from list response first (faster)
+				// Try to extract key from list response first (faster). A readable
+				// payload decides the match; a non-matching one is never refetched.
 				existingKey := r.extractDeploymentKey(d)
-				if existingKey != nil && existingKey.ID == historyID && existingKey.Site == site {
-					dep = d
-					keyToDeployment[key] = dep
-					break
+				if existingKey != nil {
+					if existingKey.ID == historyID && existingKey.Site == site {
+						dep = d
+						keyToDeployment[key] = dep
+						break
+					}
+					continue
 				}
 
-				// If payload extraction failed, fetch individually to get full payload
+				// Only when the list item's payload is unreadable, fetch it
+				// individually to get the full payload.
 				fullDeployment, _, err := gh.Repositories.GetDeployment(ctx, owner, repo, *d.ID)
 				if err != nil {
 					continue
@@ -1055,10 +1057,10 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 }
 
 // statusAlreadyPosted reports whether the exact state+description exists among the
-// statuses (newest first). A Deregistered marker as newest status means the site
+// statuses (newest first). A Deregistered marker as the effective newest status means the site
 // is registering again, so the de-dup must not apply.
 func statusAlreadyPosted(statuses []*github.DeploymentStatus, state, desc string) bool {
-	if len(statuses) == 0 || isDeregisteredStatus(statuses[0]) {
+	if len(statuses) == 0 || isDeregistered(statuses) {
 		return false
 	}
 	for _, status := range statuses {
@@ -1572,7 +1574,7 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 	// displayed history. Each environment shows one site (see displayDeployments).
 	ownSites := r.ownSitesByEnv(environment, environmentList)
 	for envName, deps := range envDeployments {
-		envDeployments[envName] = r.displayDeployments(envName, deps, ownSites)
+		envDeployments[envName] = r.displayDeployments(ctx, ghClient, owner, repo, envName, deps, ownSites)
 	}
 
 	// Build set of relevant environments based on relationships
@@ -1726,7 +1728,7 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 				}
 				opts.Page = resp.NextPage
 			}
-			allDeploymentsForEnv = r.displayDeployments(envName, allDeploymentsForEnv, ownSites)
+			allDeploymentsForEnv = r.displayDeployments(ctx, ghClient, owner, repo, envName, allDeploymentsForEnv, ownSites)
 			envDeployments[envName] = allDeploymentsForEnv
 
 			if len(allDeploymentsForEnv) == 0 {

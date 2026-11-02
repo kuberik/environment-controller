@@ -90,6 +90,23 @@ func isDeregisteredStatus(s *github.DeploymentStatus) bool {
 	return s != nil && strings.HasPrefix(s.GetDescription(), deregisteredPrefix)
 }
 
+// isDeregistered reports whether a deployment's statuses (newest first) say its
+// site is deregistered. GitHub's automatic "inactive" statuses (no description),
+// which a later success in the same GitHub environment appends, do not bury the
+// marker; any other newer status means the site registered again.
+func isDeregistered(statuses []*github.DeploymentStatus) bool {
+	for _, s := range statuses {
+		if isDeregisteredStatus(s) {
+			return true
+		}
+		if s.GetState() == "inactive" && s.GetDescription() == "" {
+			continue
+		}
+		return false
+	}
+	return false
+}
+
 // ---- per-reconcile status cache -------------------------------------------
 
 type reconcileCacheKey struct{}
@@ -151,29 +168,37 @@ func (r *GitHubEnvironmentReconciler) ownSitesByEnv(current *kuberikv1alpha1.Env
 
 // displayDeployments narrows an environment's deployments to ONE site, because
 // Rollout history IDs are per-cluster sequences and merging sites would collide
-// them. Environments without any sited deployment are returned untouched. An
+// them. Sites whose newest deployment's newest status is the deregistration
+// marker are dead and ignored (one cached status fetch per site). Environments
+// without any registered site show their site-less deployments untouched. An
 // environment with a local Environment resource shows that resource's site; any
-// other sited environment shows its lowest-wave site (ties: lowest name).
-//
-// DECISION: deregistered sites are not excluded here (that would cost one status
-// fetch per site for display only); the wave logic itself handles deregistration.
-func (r *GitHubEnvironmentReconciler) displayDeployments(envName string, deps []*github.Deployment, ownSites map[string]string) []*github.Deployment {
+// other sited environment shows its lowest-wave registered site (ties: lowest
+// name).
+func (r *GitHubEnvironmentReconciler) displayDeployments(ctx context.Context, gh *github.Client, owner, repo, envName string, deps []*github.Deployment, ownSites map[string]string) []*github.Deployment {
 	type siteInfo struct {
 		wave int32
 		id   int64
 	}
-	sites := map[string]siteInfo{}
+	newest := map[string]siteInfo{}
 	for _, d := range deps {
 		p := r.extractDeploymentPayload(d)
 		if p == nil || p.Site == "" {
 			continue
 		}
-		if cur, ok := sites[p.Site]; !ok || d.GetID() > cur.id {
-			sites[p.Site] = siteInfo{wave: p.Wave, id: d.GetID()}
+		if cur, ok := newest[p.Site]; !ok || d.GetID() > cur.id {
+			newest[p.Site] = siteInfo{wave: p.Wave, id: d.GetID()}
 		}
 	}
-	if len(sites) == 0 {
+	if len(newest) == 0 {
 		return deps
+	}
+	sites := map[string]siteInfo{}
+	for name, info := range newest {
+		statuses, err := r.fetchAllDeploymentStatuses(ctx, gh, owner, repo, info.id)
+		if err == nil && isDeregistered(statuses) {
+			continue
+		}
+		sites[name] = info
 	}
 	site, ok := ownSites[envName]
 	if !ok {
@@ -188,7 +213,9 @@ func (r *GitHubEnvironmentReconciler) displayDeployments(envName string, deps []
 			}
 			return names[i] < names[j]
 		})
-		site = names[0]
+		if len(names) > 0 {
+			site = names[0]
+		} // else: no registered site, show the site-less deployments
 	}
 	out := make([]*github.Deployment, 0, len(deps))
 	for _, d := range deps {
@@ -300,7 +327,7 @@ func (r *GitHubEnvironmentReconciler) readMembers(ctx context.Context, gh *githu
 						m.Wave = 1
 					}
 					m.Lockstep = p.Lockstep
-					m.Deregistered = len(statuses) > 0 && isDeregisteredStatus(statuses[0])
+					m.Deregistered = isDeregistered(statuses)
 				}
 				m.Deployments = append(m.Deployments, wave.Deployment{
 					Revision:  *p.Version.Revision,
@@ -429,6 +456,8 @@ func (r *GitHubEnvironmentReconciler) reconcileWave(ctx context.Context, gh *git
 func (r *GitHubEnvironmentReconciler) applyWaveStatus(ctx context.Context, env *kuberikv1alpha1.Environment, in wave.Input, dec wave.Decision) error {
 	ws := &kuberikv1alpha1.WaveStatus{
 		Site:             in.Self.Site,
+		Environment:      env.Spec.Environment,
+		Name:             ensureKuberikPrefix(env.Spec.Name),
 		Wave:             in.Self.Wave,
 		Role:             kuberikv1alpha1.WaveRole(dec.Role),
 		Leader:           dec.Leader,
@@ -539,17 +568,47 @@ func (r *GitHubEnvironmentReconciler) event(env *kuberikv1alpha1.Environment, ev
 	}
 }
 
-// deregisterSite posts the deregistration marker on the site's newest
-// deployment. Idempotent: nothing is posted when the marker is already newest or
-// the site never deployed.
-func (r *GitHubEnvironmentReconciler) deregisterSite(ctx context.Context, gh *github.Client, env *kuberikv1alpha1.Environment, site string) error {
+// regIdentity is what a sited Environment wrote to GitHub: the deployment name
+// (with the kuberik prefix), the environment and the site. Deregistration must
+// use the identity that was written, not whatever the spec says now.
+type regIdentity struct {
+	name, environment, site string
+}
+
+func (r *GitHubEnvironmentReconciler) currentIdentity(env *kuberikv1alpha1.Environment) regIdentity {
+	return regIdentity{name: ensureKuberikPrefix(env.Spec.Name), environment: env.Spec.Environment, site: r.effectiveSite(env)}
+}
+
+// recordedIdentity is the identity persisted in status.wave. Fields missing from
+// older status fall back to the current spec. ok is false when nothing was
+// recorded.
+func (r *GitHubEnvironmentReconciler) recordedIdentity(env *kuberikv1alpha1.Environment) (regIdentity, bool) {
+	w := env.Status.Wave
+	if w == nil || w.Site == "" {
+		return regIdentity{}, false
+	}
+	id := r.currentIdentity(env)
+	id.site = w.Site
+	if w.Environment != "" {
+		id.environment = w.Environment
+	}
+	if w.Name != "" {
+		id.name = w.Name
+	}
+	return id, true
+}
+
+// deregisterSite posts the deregistration marker on the newest deployment of
+// (name, environment, site). Idempotent: nothing is posted when the marker is
+// already newest or the site never deployed. The marker is always posted with
+// auto_inactive=false, whatever the Environment's site is now.
+func (r *GitHubEnvironmentReconciler) deregisterSite(ctx context.Context, gh *github.Client, env *kuberikv1alpha1.Environment, id regIdentity) error {
 	owner, repo, err := parseProject(env.Spec.Backend.Project)
 	if err != nil {
 		return err
 	}
-	deploymentName := ensureKuberikPrefix(env.Spec.Name)
-	task := formatDeploymentTask(deploymentName)
-	formattedEnv := formatDeploymentEnvironment(deploymentName, env.Spec.Environment)
+	task := formatDeploymentTask(id.name)
+	formattedEnv := formatDeploymentEnvironment(id.name, id.environment)
 
 	opts := &github.DeploymentsListOptions{Task: task, Environment: formattedEnv, ListOptions: github.ListOptions{PerPage: deploymentsPerPage}}
 	var newest *github.Deployment
@@ -559,7 +618,7 @@ func (r *GitHubEnvironmentReconciler) deregisterSite(ctx context.Context, gh *gi
 			return fmt.Errorf("failed to list deployments: %w", err)
 		}
 		for _, d := range deps { // newest first
-			if p := r.extractDeploymentPayload(d); p != nil && p.Site == site {
+			if p := r.extractDeploymentPayload(d); p != nil && p.Site == id.site {
 				newest = d
 				break
 			}
@@ -576,10 +635,20 @@ func (r *GitHubEnvironmentReconciler) deregisterSite(ctx context.Context, gh *gi
 	if err != nil {
 		return fmt.Errorf("failed to read statuses of deployment %d: %w", newest.GetID(), err)
 	}
-	if len(statuses) > 0 && isDeregisteredStatus(statuses[0]) {
+	if isDeregistered(statuses) {
 		return nil
 	}
-	return r.createDeploymentStatusWithURL(ctx, gh, env, newest.GetID(), "inactive", fmt.Sprintf(deregistrationMarker, site), false)
+	reconcileCacheFrom(ctx).invalidate(newest.GetID())
+	_, _, err = gh.Repositories.CreateDeploymentStatus(ctx, owner, repo, newest.GetID(), &github.DeploymentStatusRequest{
+		State:        github.String("inactive"),
+		Description:  github.String(fmt.Sprintf(deregistrationMarker, id.site)),
+		Environment:  &formattedEnv,
+		AutoInactive: github.Bool(false),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create deployment status: %w", err)
+	}
+	return nil
 }
 
 func (r *GitHubEnvironmentReconciler) removeFinalizer(ctx context.Context, env *kuberikv1alpha1.Environment) error {
@@ -604,10 +673,11 @@ func (r *GitHubEnvironmentReconciler) reconcileDelete(ctx context.Context, env *
 		lg.Info("Skipping deregistration (annotation)")
 		return ctrl.Result{}, r.removeFinalizer(ctx, env)
 	}
-	site := r.effectiveSite(env)
-	if env.Status.Wave != nil && env.Status.Wave.Site != "" {
-		site = env.Status.Wave.Site // what was actually written to GitHub
+	id := r.currentIdentity(env)
+	if rec, ok := r.recordedIdentity(env); ok {
+		id = rec // what was actually written to GitHub
 	}
+	site := id.site
 	if site == "" || env.Spec.Backend.Type != "github" {
 		return ctrl.Result{}, r.removeFinalizer(ctx, env)
 	}
@@ -621,7 +691,7 @@ func (r *GitHubEnvironmentReconciler) reconcileDelete(ctx context.Context, env *
 		}
 		return ctrl.Result{}, err
 	}
-	if err := r.deregisterSite(ctx, gh, env, site); err != nil {
+	if err := r.deregisterSite(ctx, gh, env, id); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, r.removeFinalizer(ctx, env)
@@ -635,24 +705,34 @@ func (r *GitHubEnvironmentReconciler) namespaceTerminating(ctx context.Context, 
 	return ns.DeletionTimestamp != nil || ns.Status.Phase == corev1.NamespaceTerminating
 }
 
-// reconcileSiteChange handles the finalizer and site transitions before sync:
-//   - sited: ensure the finalizer; when status.wave.site differs from the
-//     effective site, deregister the old site first.
-//   - site-less but still carrying the finalizer (site removed): deregister the
-//     old site, release the finalizer and drop the wave status and conditions.
+// reconcileSiteChange handles the finalizer and registration identity before any
+// GitHub write:
+//   - sited: when the recorded (name, environment, site) differs from the
+//     current one, deregister the OLD identity first, then persist the new one in
+//     status.wave. The identity is persisted only when it is new.
+//   - site-less but still carrying the finalizer or a recorded site (site
+//     removed): deregister the recorded identity, release the finalizer and drop
+//     the wave status and conditions.
 func (r *GitHubEnvironmentReconciler) reconcileSiteChange(ctx context.Context, gh *github.Client, env *kuberikv1alpha1.Environment) error {
-	site := r.effectiveSite(env)
-	old := ""
-	if env.Status.Wave != nil {
-		old = env.Status.Wave.Site
-	}
-	if old != "" && old != site {
+	cur := r.currentIdentity(env)
+	old, hadOld := r.recordedIdentity(env)
+	if hadOld && old != cur {
 		if err := r.deregisterSite(ctx, gh, env, old); err != nil {
 			return err
 		}
 	}
-	if site != "" {
-		return nil
+	if cur.site != "" {
+		w := env.Status.Wave
+		if w != nil && w.Site == cur.site && w.Environment == cur.environment && w.Name == cur.name {
+			return nil
+		}
+		if hadOld && old == cur {
+			// recorded by an older version without the identity fields: keep the rest
+			w.Environment, w.Name = cur.environment, cur.name
+		} else {
+			env.Status.Wave = &kuberikv1alpha1.WaveStatus{Site: cur.site, Environment: cur.environment, Name: cur.name, Wave: r.effectiveWave(env)}
+		}
+		return r.Status().Update(ctx, env)
 	}
 	if env.Status.Wave != nil || controllerutil.ContainsFinalizer(env, DeregisterFinalizer) {
 		env.Status.Wave = nil

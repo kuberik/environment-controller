@@ -70,6 +70,34 @@ func (f *fakeGitHub) countCalls(prefix string) int {
 	return n
 }
 
+// statusListCalls counts GET .../deployments/{id}/statuses calls per deployment ID.
+func (f *fakeGitHub) statusListCalls() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]int{}
+	for _, c := range f.calls {
+		parts := strings.Split(strings.TrimPrefix(c, "GET "), "/")
+		if strings.HasPrefix(c, "GET ") && len(parts) == 7 && parts[4] == "deployments" && parts[6] == "statuses" {
+			out[parts[5]]++
+		}
+	}
+	return out
+}
+
+// getDeploymentCalls counts GET .../deployments/{id} (single deployment) calls.
+func (f *fakeGitHub) getDeploymentCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		parts := strings.Split(strings.TrimPrefix(c, "GET "), "/")
+		if strings.HasPrefix(c, "GET ") && len(parts) == 6 && parts[4] == "deployments" {
+			n++
+		}
+	}
+	return n
+}
+
 // addDeployment seeds a deployment (payload is marshalled as a JSON object).
 func (f *fakeGitHub) addDeployment(task, env, ref string, payload any) int64 {
 	raw, _ := json.Marshal(payload)

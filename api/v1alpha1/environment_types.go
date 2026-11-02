@@ -191,6 +191,14 @@ type WaveMemberStatus struct {
 type WaveStatus struct {
 	// Site is the effective site of this Environment (spec or controller default).
 	Site string `json:"site"`
+	// Environment is the environment name this site was registered under in
+	// GitHub. Deregistration uses it even after spec.environment changed.
+	// +optional
+	Environment string `json:"environment,omitempty"`
+	// Name is the deployment name as written to GitHub (with the kuberik prefix).
+	// Deregistration uses it even after spec.name changed.
+	// +optional
+	Name string `json:"name,omitempty"`
 	// Wave is the effective wave of this Environment.
 	Wave int32 `json:"wave"`
 	// Role is Leader or Follower within (environment, wave). It is also the role

@@ -415,6 +415,11 @@ spec:
                 description: Wave is set for Environments with a site and describes
                   their wave state.
                 properties:
+                  environment:
+                    description: |-
+                      Environment is the environment name this site was registered under in
+                      GitHub. Deregistration uses it even after spec.environment changed.
+                    type: string
                   leader:
                     description: Leader is the site leading this (environment, wave).
                     type: string
@@ -452,6 +457,11 @@ spec:
                       type: object
                     type: array
                     x-kubernetes-list-type: atomic
+                  name:
+                    description: |-
+                      Name is the deployment name as written to GitHub (with the kuberik prefix).
+                      Deregistration uses it even after spec.name changed.
+                    type: string
                   role:
                     description: |-
                       Role is Leader or Follower within (environment, wave). It is also the role

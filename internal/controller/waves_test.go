@@ -648,6 +648,7 @@ func TestCandidatesOfIncludesDeployedRelease(t *testing.T) {
 	rev := func(s string) *string { return &s }
 	r := &kuberikrolloutv1alpha1.Rollout{}
 	r.Status.AvailableReleases = []kuberikrolloutv1alpha1.VersionInfo{
+		{Tag: "v0", Revision: rev("000")},
 		{Tag: "v1", Revision: rev("aaa")},
 		{Tag: "v2", Revision: rev("bbb")},
 	}
@@ -655,8 +656,11 @@ func TestCandidatesOfIncludesDeployedRelease(t *testing.T) {
 	r.Status.ReleaseCandidates = []kuberikrolloutv1alpha1.VersionInfo{
 		{Tag: "v2", Revision: rev("bbb")},
 	}
+	r.Status.History = []kuberikrolloutv1alpha1.DeploymentHistoryEntry{
+		{Version: kuberikrolloutv1alpha1.VersionInfo{Tag: "v1", Revision: rev("aaa")}},
+	}
 	c := candidatesOf(r)
 	if c["aaa"] != "v1" || c["bbb"] != "v2" || len(c) != 2 {
-		t.Fatalf("candidatesOf = %v, want aaa->v1, bbb->v2", c)
+		t.Fatalf("candidatesOf = %v, want aaa->v1, bbb->v2 only", c)
 	}
 }

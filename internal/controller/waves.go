@@ -355,19 +355,17 @@ func newestDeployment(m wave.Member) (wave.Deployment, bool) {
 	return best, found
 }
 
-// candidatesOf maps revisions to tags the Rollout knows about. Release
-// candidates win; available releases fill in the rest. The rollout controller
-// drops the version it already runs from releaseCandidates, so without the
-// available releases a site that is up to date with its wave's selection would
-// report WaitingForCandidate forever instead of Ready. Allowing a tag the site
-// already runs, or an older one, is harmless: the rollout controller only moves
-// to release candidates.
+// candidatesOf maps revisions to tags: the Rollout's release candidates plus
+// the release it runs now. The rollout controller drops the running version
+// from releaseCandidates, so without it a site that is up to date with its
+// wave's selection would report WaitingForCandidate forever instead of Ready.
+// Only the running release is added (not every available release) so the
+// gate's allowedVersions stays short.
 func candidatesOf(rollout *kuberikrolloutv1alpha1.Rollout) map[string]string {
 	c := map[string]string{}
-	for _, cand := range rollout.Status.AvailableReleases {
-		if cand.Revision != nil && *cand.Revision != "" && cand.Tag != "" {
-			c[*cand.Revision] = cand.Tag
-		}
+	if h := rollout.Status.History; len(h) > 0 && h[0].Version.Revision != nil &&
+		*h[0].Version.Revision != "" && h[0].Version.Tag != "" {
+		c[*h[0].Version.Revision] = h[0].Version.Tag
 	}
 	for _, cand := range rollout.Status.ReleaseCandidates {
 		if cand.Revision != nil && *cand.Revision != "" && cand.Tag != "" {

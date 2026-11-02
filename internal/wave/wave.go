@@ -185,7 +185,7 @@ type Input struct {
 	UpstreamSiteless bool
 	UpstreamBaked    []string
 	// Candidates maps revision -> tag from the local Rollout's releaseCandidates
-	// and availableReleases (so the release the site already runs maps too).
+	// plus the release the site runs now (so an up-to-date site maps too).
 	Candidates map[string]string
 	// Current is the revision the local Rollout runs now ("" unknown). Only
 	// used to tell "up to date, waiting for the previous wave" from Ready.

@@ -643,3 +643,20 @@ func decodedPayload(raw json.RawMessage) []byte {
 }
 
 func base64Decode(s string) ([]byte, error) { return base64.StdEncoding.DecodeString(s) }
+
+func TestCandidatesOfIncludesDeployedRelease(t *testing.T) {
+	rev := func(s string) *string { return &s }
+	r := &kuberikrolloutv1alpha1.Rollout{}
+	r.Status.AvailableReleases = []kuberikrolloutv1alpha1.VersionInfo{
+		{Tag: "v1", Revision: rev("aaa")},
+		{Tag: "v2", Revision: rev("bbb")},
+	}
+	// The running version (v1) is not a release candidate.
+	r.Status.ReleaseCandidates = []kuberikrolloutv1alpha1.VersionInfo{
+		{Tag: "v2", Revision: rev("bbb")},
+	}
+	c := candidatesOf(r)
+	if c["aaa"] != "v1" || c["bbb"] != "v2" || len(c) != 2 {
+		t.Fatalf("candidatesOf = %v, want aaa->v1, bbb->v2", c)
+	}
+}

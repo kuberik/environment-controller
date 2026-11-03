@@ -93,7 +93,8 @@ func EarlierTiers(name string) []string {
 
 // UnknownTierMessage explains that name is not a tier and lists the accepted names.
 func UnknownTierMessage(name string) string {
-	var canon, aliases []string
+	canon := make([]string, 0, len(tiers))
+	var aliases []string
 	for _, t := range tiers {
 		canon = append(canon, t[0])
 		aliases = append(aliases, t[1:]...)

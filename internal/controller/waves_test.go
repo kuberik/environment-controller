@@ -417,6 +417,20 @@ var _ = Describe("Sites and waves", func() {
 		Expect(fake.getDeploymentCalls()).To(BeZero())
 	})
 
+	It("shares the history sync's status lists with the wave reading", func() {
+		mkRollout(histEntry(1, wRevA, "v1"))
+		e := mkEnv("eu", euSite, nil)
+		reconcile(e) // creates the deployment
+		before := map[string]int{}
+		for id, n := range fake.statusListCalls() {
+			before[id] = n
+		}
+		reconcile(e) // history entry exists now: sync checks its statuses
+		for id, n := range fake.statusListCalls() {
+			Expect(n-before[id]).To(BeNumerically("<=", 1), "statuses of deployment %s fetched %d times in one reconcile", id, n-before[id])
+		}
+	})
+
 	Describe("history display with deregistered sites", func() {
 		It("follows newer legacy deployments (site default) once every upstream site is deregistered", func() {
 			stg := seed(stagGH, "stg", 1, false, wRevA, "v1", "Succeeded")
@@ -1078,5 +1092,14 @@ func TestFinalizerUsesPatchNotUpdate(t *testing.T) {
 	}
 	if patches != 2 {
 		t.Fatalf("patches = %d, want 2", patches)
+	}
+}
+
+func TestControllerOptionsConcurrency(t *testing.T) {
+	if got := (&GitHubEnvironmentReconciler{}).controllerOptions().MaxConcurrentReconciles; got != 1 {
+		t.Fatalf("zero value = %d, want 1", got)
+	}
+	if got := (&GitHubEnvironmentReconciler{MaxConcurrentReconciles: 4}).controllerOptions().MaxConcurrentReconciles; got != 4 {
+		t.Fatalf("got %d, want 4", got)
 	}
 }

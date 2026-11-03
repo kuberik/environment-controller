@@ -40,6 +40,7 @@ import (
 	k8sptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllerruntimectrl "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -131,6 +132,10 @@ type GitHubEnvironmentReconciler struct {
 	// APIReader reads the cluster identity uncached (the manager cache has no
 	// Namespace informer). Nil falls back to Client (tests).
 	APIReader client.Reader
+
+	// MaxConcurrentReconciles is the number of parallel reconciles (cmd/main.go
+	// --max-concurrent-reconciles). Values below 1 mean 1.
+	MaxConcurrentReconciles int
 
 	// GitHubBaseURL overrides the GitHub API base URL (tests point it at a fake
 	// server). Empty means api.github.com.
@@ -295,6 +300,11 @@ func (r *GitHubEnvironmentReconciler) requeueResult(ctx context.Context, deploym
 	return ctrl.Result{RequeueAfter: requeueInterval}
 }
 
+// controllerOptions returns the controller options derived from the reconciler.
+func (r *GitHubEnvironmentReconciler) controllerOptions() controllerruntimectrl.Options {
+	return controllerruntimectrl.Options{MaxConcurrentReconciles: max(r.MaxConcurrentReconciles, 1)}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *GitHubEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -304,6 +314,7 @@ func (r *GitHubEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.rolloutToEnvironment),
 		).
 		Named("environment").
+		WithOptions(r.controllerOptions()).
 		Complete(r)
 }
 
@@ -1035,7 +1046,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 
 		// Check all statuses to see if we've already created this exact status
 		// This prevents duplicate statuses like: pending -> success -> pending
-		statuses, _, err := gh.Repositories.ListDeploymentStatuses(ctx, owner, repo, dep.GetID(), &github.ListOptions{})
+		statuses, err := r.fetchAllDeploymentStatuses(ctx, gh, owner, repo, dep.GetID())
 		statusExists := err == nil && statusAlreadyPosted(statuses, ghState, ghDesc)
 		if !statusExists {
 			if err := r.createDeploymentStatus(ctx, gh, environment, dep.GetID(), ghState, ghDesc); err != nil {

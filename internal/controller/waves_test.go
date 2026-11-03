@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -24,6 +25,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	k8sptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -973,5 +975,50 @@ func TestClusterIDUsesAPIReader(t *testing.T) {
 	id, err := r.clusterID(context.Background())
 	if err != nil || id != "uid-123" {
 		t.Fatalf("clusterID = %q, %v", id, err)
+	}
+}
+
+// namespaceTerminating must read through APIReader: the manager cache has no
+// Namespace informer and RBAC only grants get, so a cached Get would block
+// forever on the failing informer list.
+func TestNamespaceTerminatingUsesAPIReader(t *testing.T) {
+	sch := runtime.NewScheme()
+	if err := corev1.AddToScheme(sch); err != nil {
+		t.Fatal(err)
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "gone", DeletionTimestamp: &metav1.Time{Time: time.Now()}, Finalizers: []string{"x"}}}
+	// Client is nil: touching it would panic.
+	r := &GitHubEnvironmentReconciler{APIReader: fakeclient.NewClientBuilder().WithScheme(sch).WithObjects(ns).Build()}
+	got, err := r.namespaceTerminating(context.Background(), "gone")
+	if err != nil || !got {
+		t.Fatalf("namespaceTerminating = %v, %v; want true, nil", got, err)
+	}
+}
+
+type blockingReader struct{ client.Reader }
+
+func (blockingReader) Get(ctx context.Context, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A stuck API read must time out instead of freezing the single worker, and is
+// reported as "not terminating" with the error.
+func TestNamespaceTerminatingTimesOut(t *testing.T) {
+	old := namespaceReadTimeout
+	namespaceReadTimeout = 50 * time.Millisecond
+	defer func() { namespaceReadTimeout = old }()
+	r := &GitHubEnvironmentReconciler{APIReader: blockingReader{}}
+	done := make(chan struct{})
+	var got bool
+	var err error
+	go func() { got, err = r.namespaceTerminating(context.Background(), "x"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("namespaceTerminating did not respect its timeout")
+	}
+	if got || err == nil {
+		t.Fatalf("got %v, %v; want false and an error", got, err)
 	}
 }

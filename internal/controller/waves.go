@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/v62/github"
 	corev1 "k8s.io/api/core/v1"
@@ -730,7 +731,14 @@ func (r *GitHubEnvironmentReconciler) reconcileDelete(ctx context.Context, env *
 	}
 	gh, err := r.getGitHubClient(ctx, env)
 	if err != nil {
-		if apierrors.IsNotFound(err) && r.namespaceTerminating(ctx, env.Namespace) {
+		if apierrors.IsNotFound(err) {
+			terminating, nsErr := r.namespaceTerminating(ctx, env.Namespace)
+			if nsErr != nil {
+				return ctrl.Result{}, nsErr
+			}
+			if !terminating {
+				return ctrl.Result{}, err
+			}
 			msg := "namespace is terminating and the GitHub token Secret is gone; giving up deregistration of site " + site
 			lg.Info(msg)
 			r.event(env, corev1.EventTypeWarning, "DeregisterSkipped", msg)
@@ -744,12 +752,30 @@ func (r *GitHubEnvironmentReconciler) reconcileDelete(ctx context.Context, env *
 	return ctrl.Result{}, r.removeFinalizer(ctx, env)
 }
 
-func (r *GitHubEnvironmentReconciler) namespaceTerminating(ctx context.Context, name string) bool {
-	ns := &corev1.Namespace{}
-	if err := r.Get(ctx, types.NamespacedName{Name: name}, ns); err != nil {
-		return apierrors.IsNotFound(err)
+// namespaceReadTimeout bounds the Namespace read so a stuck API call can never
+// freeze the single reconcile worker.
+var namespaceReadTimeout = 10 * time.Second
+
+// namespaceTerminating reports whether the namespace is gone or terminating.
+// Namespaces are read through APIReader (the manager cache has no Namespace
+// informer and RBAC only grants get: a cached Get would start an informer whose
+// list is forbidden and block forever); r.Client is used only when APIReader is
+// nil (tests). On a read error it returns false and the error.
+func (r *GitHubEnvironmentReconciler) namespaceTerminating(ctx context.Context, name string) (bool, error) {
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
 	}
-	return ns.DeletionTimestamp != nil || ns.Status.Phase == corev1.NamespaceTerminating
+	ctx, cancel := context.WithTimeout(ctx, namespaceReadTimeout)
+	defer cancel()
+	ns := &corev1.Namespace{}
+	if err := reader.Get(ctx, types.NamespacedName{Name: name}, ns); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("failed to read namespace %s: %w", name, err)
+	}
+	return ns.DeletionTimestamp != nil || ns.Status.Phase == corev1.NamespaceTerminating, nil
 }
 
 // reconcileSiteChange handles the registration identity before any GitHub

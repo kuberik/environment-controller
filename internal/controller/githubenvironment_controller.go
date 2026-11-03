@@ -40,7 +40,6 @@ import (
 	k8sptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -178,11 +177,8 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	ctx = withReconcileCache(ctx)
 
 	// Every Environment carries the deregistration finalizer.
-	if !controllerutil.ContainsFinalizer(deployment, DeregisterFinalizer) {
-		controllerutil.AddFinalizer(deployment, DeregisterFinalizer)
-		if err := r.Update(ctx, deployment); err != nil {
-			return ctrl.Result{}, err
-		}
+	if err := r.addFinalizer(ctx, deployment); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Validate backend

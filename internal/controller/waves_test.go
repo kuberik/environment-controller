@@ -27,6 +27,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
@@ -1020,5 +1021,47 @@ func TestNamespaceTerminatingTimesOut(t *testing.T) {
 	}
 	if got || err == nil {
 		t.Fatalf("got %v, %v; want false and an error", got, err)
+	}
+}
+
+// Finalizers are added and removed with a merge patch, not a full-object
+// Update: an object that fails full-object validation (e.g. a spec.environment
+// outside the new enum) must still get its finalizer handled.
+func TestFinalizerUsesPatchNotUpdate(t *testing.T) {
+	sch := runtime.NewScheme()
+	if err := kuberikv1alpha1.AddToScheme(sch); err != nil {
+		t.Fatal(err)
+	}
+	env := &kuberikv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns"}, Spec: kuberikv1alpha1.EnvironmentSpec{Environment: "canary"}}
+	var patches int
+	c := fakeclient.NewClientBuilder().WithScheme(sch).WithObjects(env).WithInterceptorFuncs(interceptor.Funcs{
+		Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+			return fmt.Errorf("spec.environment: Unsupported value")
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, o client.Object, p client.Patch, opts ...client.PatchOption) error {
+			patches++
+			return c.Patch(ctx, o, p, opts...)
+		},
+	}).Build()
+	r := &GitHubEnvironmentReconciler{Client: c}
+	ctx := context.Background()
+	cur := &kuberikv1alpha1.Environment{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(env), cur); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.addFinalizer(ctx, cur); err != nil {
+		t.Fatalf("addFinalizer: %v", err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(env), cur); err != nil || !controllerutil.ContainsFinalizer(cur, DeregisterFinalizer) {
+		t.Fatalf("finalizer not added: %v", err)
+	}
+	if err := r.removeFinalizer(ctx, cur); err != nil {
+		t.Fatalf("removeFinalizer: %v", err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(env), cur); err != nil || controllerutil.ContainsFinalizer(cur, DeregisterFinalizer) {
+		t.Fatalf("finalizer not removed: %v", err)
+	}
+	if patches != 2 {
+		t.Fatalf("patches = %d, want 2", patches)
 	}
 }

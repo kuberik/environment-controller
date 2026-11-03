@@ -138,6 +138,7 @@ When the wave-1 leader sets `lockstep: true`, its allowed set is pinned to the c
 | `WaveReady` | `False` / `DuplicateSite` | Another Environment owns this deployment name + tier + site (message names the owner). See [One owner per site](#one-owner-per-site). |
 | `WaveReady` | `False` / `WaitingForCandidate` | The wanted revision has no release-candidate tag yet. |
 | `WaveReady` | `False` / `Pinned` | The Rollout pins `spec.wantedVersion`. |
+| `WaveReady` | `False` / `UnknownTier` | `spec.environment` is not one of the nine tier names (only possible for objects that predate the enum). The gate is closed (`allowedVersions: []`); the message names the value and the accepted names. |
 | `WaveReady` | `False` / `InvalidTopology` | Waves have a gap (this or the upstream environment). |
 | `WaveReady` | `False` / `LockstepWaiting` | Lockstep holds the leader on the current selection. |
 | `LockstepConsistent` | `False` / `LockstepMismatch` | A member disagrees with the leader's `lockstep`. |
@@ -251,7 +252,7 @@ data:
 `spec.relationship` (`After`, `Alongside`, `Parallel`) is gone as a feature: environment order is fixed by tier, and a site always has a wave. To upgrade:
 
 1. Apply the new CRD, then the new controller, in every cluster that reports to the same GitHub repository.
-2. Rename non-standard `spec.environment` values to one of the nine accepted names (`dev`, `development`, `test`, `qa`, `staging`, `stage`, `preprod`, `prod`, `production`). Objects outside that set fail validation on their next update; they keep running until then.
+2. Rename non-standard `spec.environment` values to one of the nine accepted names (`dev`, `development`, `test`, `qa`, `staging`, `stage`, `preprod`, `prod`, `production`). Objects outside that set fail validation on their next update; they keep running until then, but their gate is **closed** (`allowedVersions: []`, `WaveReady=False`, reason `UnknownTier`, the message names the value and the accepted names) because an unknown tier has no place in the order. The controller still adds and removes its finalizer with a patch, so such an object can be deleted. Renaming `spec.environment` changes the GitHub environment name (`kuberik/<name>/<environment>`): the controller deregisters the old identity (inactive marker on the old environment's newest deployment) and posts new deployments under the new name, so the Environment's own GitHub history and the dashboard graph for that environment start fresh. The old deployments stay in GitHub and still count for tier membership while they are not deregistered. Rename during a quiet period.
 3. Optionally set `spec.site` and `spec.wave` (or provide the site once per cluster through the `site` key of the `kuberik-cluster-info` ConfigMap).
 4. Remove `spec.relationship` at your leisure. It is accepted and ignored (condition `Deprecated=True`, reason `RelationshipIgnored`) and will be removed in a later release.
 5. GitHub history continues: deployments without a site count as site `default`, wave 1. Keep the effective site `default` for the first reconcile after the upgrade (do not set the ConfigMap `site` before upgrading). Setting a site afterwards deregisters `default`, and the Environment continues under its new site.

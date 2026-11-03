@@ -698,12 +698,24 @@ func (r *GitHubEnvironmentReconciler) deregisterSite(ctx context.Context, gh *gi
 	return nil
 }
 
+func (r *GitHubEnvironmentReconciler) addFinalizer(ctx context.Context, env *kuberikv1alpha1.Environment) error {
+	if controllerutil.ContainsFinalizer(env, DeregisterFinalizer) {
+		return nil
+	}
+	// A merge patch sends only metadata.finalizers: an object that fails
+	// full-object validation can still get its finalizer.
+	base := env.DeepCopy()
+	controllerutil.AddFinalizer(env, DeregisterFinalizer)
+	return r.Patch(ctx, env, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+}
+
 func (r *GitHubEnvironmentReconciler) removeFinalizer(ctx context.Context, env *kuberikv1alpha1.Environment) error {
 	if !controllerutil.ContainsFinalizer(env, DeregisterFinalizer) {
 		return nil
 	}
+	base := env.DeepCopy()
 	controllerutil.RemoveFinalizer(env, DeregisterFinalizer)
-	if err := r.Update(ctx, env); err != nil {
+	if err := r.Patch(ctx, env, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return client.IgnoreNotFound(err)
 	}
 	return nil

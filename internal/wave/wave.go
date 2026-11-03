@@ -116,6 +116,7 @@ const (
 	ReasonWaitingForCandidate = "WaitingForCandidate"
 	ReasonPinned              = "Pinned"
 	ReasonInvalidTopology     = "InvalidTopology"
+	ReasonUnknownTier         = "UnknownTier"
 	ReasonLockstepWaiting     = "LockstepWaiting"
 	ReasonLockstepMismatch    = "LockstepMismatch"
 )
@@ -224,6 +225,11 @@ type Decision struct {
 // Decide computes Self's role and gate. Pure; see the package doc for the rules.
 func Decide(in Input) Decision {
 	s := in.Self
+	// An environment outside the tier enum has no position in the order, so no
+	// upstream can be determined: fail closed rather than open the gate.
+	if Rank(s.Environment) < 0 {
+		return blocked(Decision{Role: RoleFollower}, &Blocker{Reason: ReasonUnknownTier, Message: UnknownTierMessage(s.Environment)})
+	}
 	sm, selfRegistered := selfMember(in)
 	own := newFleet(s.Environment, in.Members, sm, selfRegistered)
 	st := own.state(s.Wave)

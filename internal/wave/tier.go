@@ -16,6 +16,11 @@ limitations under the License.
 
 package wave
 
+import (
+	"fmt"
+	"strings"
+)
+
 // Canonical tier names and aliases.
 const (
 	TierDev     = "dev"
@@ -84,4 +89,15 @@ func EarlierTiers(name string) []string {
 		out = append(out, tiers[i][0])
 	}
 	return out
+}
+
+// UnknownTierMessage explains that name is not a tier and lists the accepted names.
+func UnknownTierMessage(name string) string {
+	var canon, aliases []string
+	for _, t := range tiers {
+		canon = append(canon, t[0])
+		aliases = append(aliases, t[1:]...)
+	}
+	return fmt.Sprintf("environment %q is not a known tier; use one of %s (aliases: %s)",
+		name, strings.Join(canon, ", "), strings.Join(aliases, ", "))
 }

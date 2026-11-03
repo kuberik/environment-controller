@@ -19,6 +19,7 @@ package wave
 import (
 	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -436,6 +437,26 @@ func TestDeterminism(t *testing.T) {
 			if got := Decide(Input{Self: s, Members: sh, Candidates: cands}); !reflect.DeepEqual(got, want) {
 				t.Fatalf("self %s: %+v != %+v", s.Site, got, want)
 			}
+		}
+	}
+}
+
+// An environment outside the tier enum (or empty) fails closed: no upstream
+// lookup is possible, so the gate must not open.
+func TestUnknownTierFailsClosed(t *testing.T) {
+	for _, env := range []string{"canary", "Prod", ""} {
+		dec := Decide(Input{Self: Self{Environment: env, Site: "a", Wave: 1}, Candidates: cands})
+		if dec.Unrestricted || dec.AllowedTags == nil || len(dec.AllowedTags) != 0 {
+			t.Errorf("env %q: gate not closed: %+v", env, dec)
+		}
+		if dec.Blocker == nil || dec.Blocker.Reason != "UnknownTier" {
+			t.Errorf("env %q: blocker = %+v, want UnknownTier", env, dec.Blocker)
+		}
+	}
+	dec := Decide(Input{Self: Self{Environment: "canary", Site: "a", Wave: 1}})
+	for _, want := range []string{`"canary"`, "dev", "test", "staging", "prod"} {
+		if !strings.Contains(dec.Blocker.Message, want) {
+			t.Errorf("message %q lacks %q", dec.Blocker.Message, want)
 		}
 	}
 }

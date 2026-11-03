@@ -460,3 +460,39 @@ func TestUnknownTierFailsClosed(t *testing.T) {
 		}
 	}
 }
+
+// Two live names of one tier (staging and preprod) must not be merged into one
+// wave chain: everything is blocked with InvalidTopology, for the tier itself
+// and for the tier downstream of it.
+func TestAliasesOfOneTierBlock(t *testing.T) {
+	stg := m("staging", "eu", 1, d(A, 1, "Succeeded", false))
+	stg.Alias = "staging"
+	pre := m("staging", "us", 1, d(A, 2, "Succeeded", false))
+	pre.Alias = "preprod"
+
+	// Self is an alias member of the aliased tier.
+	dec := Decide(Input{Self: Self{Environment: "staging", Alias: "staging", Site: "eu", Wave: 1}, Members: []Member{stg, pre}, Candidates: cands})
+	checkAliasBlock(t, dec)
+
+	// Self is downstream: the upstream tier is ambiguous.
+	dec = Decide(Input{Self: Self{Environment: "prod", Alias: "prod", Site: "x", Wave: 1, Upstream: "staging"}, Members: []Member{stg, pre}, Candidates: cands})
+	checkAliasBlock(t, dec)
+
+	// A deregistered alias does not count (rename: old identity deregistered).
+	pre.Deregistered = true
+	dec = Decide(Input{Self: Self{Environment: "prod", Alias: "prod", Site: "x", Wave: 1, Upstream: "staging"}, Members: []Member{stg, pre}, Candidates: cands})
+	if dec.Blocker != nil && dec.Blocker.Reason == ReasonInvalidTopology {
+		t.Fatalf("deregistered alias must not block: %+v", dec.Blocker)
+	}
+}
+
+func checkAliasBlock(t *testing.T, dec Decision) {
+	t.Helper()
+	if dec.Unrestricted || dec.AllowedTags == nil || len(dec.AllowedTags) != 0 {
+		t.Fatalf("gate not closed: %+v", dec)
+	}
+	want := "staging and preprod are the same tier (staging); use one name per tier, sites/waves to split"
+	if dec.Blocker == nil || dec.Blocker.Reason != ReasonInvalidTopology || dec.Blocker.Message != want {
+		t.Fatalf("blocker = %+v, want InvalidTopology %q", dec.Blocker, want)
+	}
+}

@@ -139,7 +139,7 @@ When the wave-1 leader sets `lockstep: true`, its allowed set is pinned to the c
 | `WaveReady` | `False` / `WaitingForCandidate` | The wanted revision has no release-candidate tag yet. |
 | `WaveReady` | `False` / `Pinned` | The Rollout pins `spec.wantedVersion`. |
 | `WaveReady` | `False` / `UnknownTier` | `spec.environment` is not one of the nine tier names (only possible for objects that predate the enum). The gate is closed (`allowedVersions: []`); the message names the value and the accepted names. |
-| `WaveReady` | `False` / `InvalidTopology` | Waves have a gap (this or the upstream environment). |
+| `WaveReady` | `False` / `InvalidTopology` | Waves have a gap (this or the upstream environment), or one tier is registered under two names (`staging and preprod are the same tier (staging); use one name per tier, sites/waves to split`). The gate is closed for every Environment that sees both. |
 | `WaveReady` | `False` / `LockstepWaiting` | Lockstep holds the leader on the current selection. |
 | `LockstepConsistent` | `False` / `LockstepMismatch` | A member disagrees with the leader's `lockstep`. |
 | `Deprecated` | `True` / `RelationshipIgnored` | `spec.relationship` is set; it is ignored. Removed when the field is removed. |
@@ -164,6 +164,8 @@ Exactly one Environment may own a deployment name + tier + site across all clust
 Every Environment carries the finalizer `environments.kuberik.com/deregister`. On delete the controller posts an `inactive` status `Deregistered: site <site> removed` (always with `auto_inactive: false`) on the site's newest deployment and removes the finalizer. A deregistered site no longer counts for membership, leadership or completion; its past selection records still do. GitHub's automatic `inactive` statuses (no description) appended after the marker do not undo it; any other newer status (the site deploys again) re-registers it.
 
 The identity written to GitHub (deployment name, environment, site) is recorded in `status.wave` before the first GitHub write. Changing `spec.site`, `spec.environment` or `spec.name` deregisters the old identity first, then records the new one. Removing `spec.site` moves the Environment to the default site (the controller's, else `default`): the old site is deregistered and the new one registered. Re-registering the same site simply posts fresh statuses. A deregistration frees the site for another owner (see below).
+
+Before deleting or moving every site of an environment, pin the downstream environments' Rollouts (`spec.wantedVersion`) until the upstream is back. A tier with no registered sites is skipped, so otherwise the downstream takes its versions from the next earlier tier, or becomes unrestricted if there is none.
 
 Deleting an Environment removes the site from its wave. Its RolloutGate is owned by the Environment and is garbage-collected with it, which leaves the Rollout **ungated**: it deploys freely and may pick up any new release candidate. Pin the Rollout (`spec.wantedVersion`) or delete the Rollout first if that is not what you want.
 
@@ -197,6 +199,8 @@ Counted from the code, per reconcile (H = entries in the Rollout history, N = ot
 | Environment graph (`status.environmentInfos`) | 1 list deployments of the task, then per relevant environment the paginated deployments list and one status list per displayed deployment; each of the N other Environments repeats the history sync |
 | Wave reading | for self and the upstream: up to 10 list pages (100 each), plus one status list per deployment in the newest 20 of every site; status lists are shared with the graph through a per-reconcile cache, so no deployment's statuses are fetched twice |
 | Site change or deletion | up to 10 list pages, 1 status list, 1 create status; plus the ownership check (shares the cached lists) |
+
+Follow-up: the 20-deep status window per site (`deploymentsPerSite`) is not restructured yet. Status lists of the history sync go through the per-reconcile cache, and the controller runs `--max-concurrent-reconciles` (default 4) reconciles in parallel.
 
 Large fleets multiply the status lists by the number of sites. The budget relies on the `ghcache` conditional requests (ETag): a `304 Not Modified` answer does not count against the GitHub rate limit, so an idle fleet is cheap. For large fleets raise `spec.requeueInterval` (for example `5m`) so the steady-state polling stays well under the limit.
 
@@ -253,6 +257,7 @@ data:
 
 1. Apply the new CRD, then the new controller, in every cluster that reports to the same GitHub repository.
 2. Rename non-standard `spec.environment` values to one of the nine accepted names (`dev`, `development`, `test`, `qa`, `staging`, `stage`, `preprod`, `prod`, `production`). Objects outside that set fail validation on their next update; they keep running until then, but their gate is **closed** (`allowedVersions: []`, `WaveReady=False`, reason `UnknownTier`, the message names the value and the accepted names) because an unknown tier has no place in the order. The controller still adds and removes its finalizer with a patch, so such an object can be deleted. Renaming `spec.environment` changes the GitHub environment name (`kuberik/<name>/<environment>`): the controller deregisters the old identity (inactive marker on the old environment's newest deployment) and posts new deployments under the new name, so the Environment's own GitHub history and the dashboard graph for that environment start fresh. The old deployments stay in GitHub and still count for tier membership while they are not deregistered. Rename during a quiet period.
+2a. **Mandatory if you chained aliases.** If you used two names of one tier as a chain (`staging` -> `preprod` -> `prod`, or `test` -> `qa`), the controller no longer merges them: both are the same tier and every Environment that sees both live names is blocked with `InvalidTopology`. Collapse them to one tier name and use `spec.site` / `spec.wave` to split the former stages. Deregister (delete) the Environments of the name you drop.
 3. Optionally set `spec.site` and `spec.wave` (or provide the site once per cluster through the `site` key of the `kuberik-cluster-info` ConfigMap).
 4. Remove `spec.relationship` at your leisure. It is accepted and ignored (condition `Deprecated=True`, reason `RelationshipIgnored`) and will be removed in a later release.
 5. GitHub history continues: deployments without a site count as site `default`, wave 1. Keep the effective site `default` for the first reconcile after the upgrade (do not set the ConfigMap `site` before upgrading). Setting a site afterwards deregisters `default`, and the Environment continues under its new site.

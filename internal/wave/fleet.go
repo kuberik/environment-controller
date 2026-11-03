@@ -37,7 +37,7 @@ type fleet struct {
 // registered reports whether the backend already counts Self as a member.
 func selfMember(in Input) (self *Member, registered bool) {
 	s := in.Self
-	m := Member{Environment: s.Environment, Site: s.Site, Wave: s.Wave, Lockstep: s.Lockstep}
+	m := Member{Environment: s.Environment, Alias: s.Alias, Site: s.Site, Wave: s.Wave, Lockstep: s.Lockstep}
 	for _, o := range in.Members {
 		if o.Environment == s.Environment && o.Site == s.Site {
 			m.Deployments = stampWave(o.Deployments, o.Wave)
@@ -116,8 +116,54 @@ func (f fleet) lastWave() int32 {
 	return ws[len(ws)-1]
 }
 
-// topology returns InvalidTopology when the registered waves are not 1..max.
+// aliasConflict returns InvalidTopology when registered members of one tier are
+// written under different alias names (staging and preprod): they are the same
+// tier and must not be merged silently into one chain.
+func (f fleet) aliasConflict() *Blocker {
+	seen := map[string]bool{}
+	for _, ms := range f.byWave {
+		for _, m := range registered(ms) {
+			if m.Alias != "" {
+				seen[m.Alias] = true
+			}
+		}
+	}
+	if len(seen) < 2 {
+		return nil
+	}
+	names := make([]string, 0, len(seen))
+	for a := range seen {
+		names = append(names, a)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		ai, aj := aliasIndex(f.env, names[i]), aliasIndex(f.env, names[j])
+		if ai != aj {
+			return ai < aj
+		}
+		return names[i] < names[j]
+	})
+	canon, _ := Canonical(f.env)
+	return &Blocker{Reason: ReasonInvalidTopology,
+		Message: fmt.Sprintf("%s are the same tier (%s); use one name per tier, sites/waves to split",
+			strings.Join(names[:len(names)-1], ", ")+" and "+names[len(names)-1], canon)}
+}
+
+// aliasIndex is the position of name among the aliases of tier (canonical first).
+func aliasIndex(tier, name string) int {
+	for i, a := range Aliases(tier) {
+		if a == name {
+			return i
+		}
+	}
+	return len(tiers)
+}
+
+// topology returns InvalidTopology when the registered waves are not 1..max, or
+// when one tier is registered under several names.
 func (f fleet) topology() *Blocker {
+	if b := f.aliasConflict(); b != nil {
+		return b
+	}
 	ws := f.registeredWaves()
 	if len(ws) == 0 {
 		return nil

@@ -146,7 +146,10 @@ type Deployment struct {
 // input (the first one wins).
 type Member struct {
 	Environment string
-	Site        string
+	// Alias is the tier alias the member's newest deployment was written under
+	// (the GitHub environment name); "" when unknown.
+	Alias string
+	Site  string
 	// Wave as recorded on the member's newest deployment.
 	Wave int32
 	// Lockstep as recorded on the member's newest deployment.
@@ -164,9 +167,12 @@ type Member struct {
 // Self is the Environment being reconciled.
 type Self struct {
 	Environment string
-	Site        string
-	Wave        int32
-	Lockstep    bool
+	// Alias is the environment name as written in spec (a tier alias, e.g.
+	// "preprod"); "" when unknown.
+	Alias    string
+	Site     string
+	Wave     int32
+	Lockstep bool
 	// Upstream is the nearest earlier tier with registered sites, "" when none.
 	Upstream string
 	// PinnedVersion is the local Rollout's spec.wantedVersion ("" when not pinned).

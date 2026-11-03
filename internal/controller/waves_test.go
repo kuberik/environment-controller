@@ -250,6 +250,21 @@ var _ = Describe("Sites and waves", func() {
 		Expect(c.Reason).To(Equal(wave.ReasonInvalidTopology))
 	})
 
+	It("blocks a tier written under two live names with InvalidTopology", func() {
+		seedStaging()
+		seed("kuberik/"+wApp+"/preprod", "pre", 1, false, wRevA, "v1", "Succeeded")
+		seed(prodGH, "us-east-1", 1, false, wRevA, "v1", "Succeeded")
+		mkRollout(histEntry(1, wRevA, "v1"))
+		e := mkEnv("eu", euSite, nil)
+		reconcile(e)
+
+		Expect(*gateAllowed(e)).To(BeEmpty())
+		c := cond(e, ConditionWaveReady)
+		Expect(c.Status).To(Equal(metav1.ConditionFalse))
+		Expect(c.Reason).To(Equal(wave.ReasonInvalidTopology))
+		Expect(c.Message).To(Equal("staging and preprod are the same tier (staging); use one name per tier, sites/waves to split"))
+	})
+
 	It("writes site metadata, selection and auto_inactive=false on sited deployments", func() {
 		seed(prodGH, "us-east-1", 1, false, wRevA, "v1", "Succeeded")
 		mkRollout(histEntry(1, wRevA, "v1"))

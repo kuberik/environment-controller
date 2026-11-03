@@ -354,7 +354,9 @@ func (r *GitHubEnvironmentReconciler) membersOf(ctx context.Context, gh *github.
 		if len(sd) > deploymentsPerSite {
 			sd = sd[:deploymentsPerSite]
 		}
-		m := wave.Member{Environment: tier, Site: s}
+		alias := sd[0].GetEnvironment()
+		alias = alias[strings.LastIndex(alias, "/")+1:]
+		m := wave.Member{Environment: tier, Alias: alias, Site: s}
 		for i, d := range sd {
 			p := r.extractDeploymentPayload(d)
 			statuses, err := r.fetchAllDeploymentStatuses(ctx, gh, owner, repo, d.GetID())
@@ -490,6 +492,7 @@ func (r *GitHubEnvironmentReconciler) reconcileWave(ctx context.Context, gh *git
 	in := wave.Input{
 		Self: wave.Self{
 			Environment:   self,
+			Alias:         env.Spec.Environment,
 			Site:          site,
 			Wave:          r.effectiveWave(env),
 			Lockstep:      env.Spec.Lockstep,

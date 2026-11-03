@@ -187,6 +187,60 @@ type WaveMemberStatus struct {
 	Deregistered bool `json:"deregistered,omitempty"`
 }
 
+// SiteOwner identifies the Environment object that owns a site.
+type SiteOwner struct {
+	Cluster   string `json:"cluster"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+// WaveBlocker is the machine-readable form of a WaveReady=False condition. The
+// condition message is display text and may change; these fields are the contract.
+type WaveBlocker struct {
+	// Reason is the WaveReady reason.
+	Reason string `json:"reason"`
+	// Environment is the canonical tier of the member waited on or at fault.
+	// +optional
+	Environment string `json:"environment,omitempty"`
+	// Site is the member waited on.
+	// +optional
+	Site string `json:"site,omitempty"`
+	// WaitingOn is what the wave waits for.
+	// +kubebuilder:validation:Enum=Selection;Bake;Candidate;Sites
+	// +optional
+	WaitingOn string `json:"waitingOn,omitempty"`
+	// Outcome is set when a leader's bake ended badly.
+	// +kubebuilder:validation:Enum=Failed;Cancelled
+	// +optional
+	Outcome string `json:"outcome,omitempty"`
+	// Revision is the full revision concerned.
+	// +optional
+	Revision string `json:"revision,omitempty"`
+	// PinnedVersion is the version the Rollout pins (Pinned).
+	// +optional
+	PinnedVersion string `json:"pinnedVersion,omitempty"`
+	// SelectedVersion is the tag of the wave's pick (Pinned).
+	// +optional
+	SelectedVersion string `json:"selectedVersion,omitempty"`
+	// Owner is the existing owner of the site (DuplicateSite).
+	// +optional
+	Owner *SiteOwner `json:"owner,omitempty"`
+	// Waves are the waves present (InvalidTopology, wave gap).
+	// +listType=atomic
+	// +optional
+	Waves []int32 `json:"waves,omitempty"`
+	// MissingWaves are the waves absent from the sequence (InvalidTopology, wave gap).
+	// +listType=atomic
+	// +optional
+	MissingWaves []int32 `json:"missingWaves,omitempty"`
+	// Names are the alias names registered for one tier (InvalidTopology), the
+	// offending name (UnknownTier), or, for DuplicateSite, names[0] is the
+	// deployment name the existing owner holds the site for.
+	// +listType=atomic
+	// +optional
+	Names []string `json:"names,omitempty"`
+}
+
 // WaveStatus describes the site/wave view the controller used for the last gate decision.
 type WaveStatus struct {
 	// Site is the effective site of this Environment (spec or controller default).
@@ -215,6 +269,9 @@ type WaveStatus struct {
 	// +listType=atomic
 	// +optional
 	Members []WaveMemberStatus `json:"members,omitempty"`
+	// Blocker explains why the site is not Ready; nil when WaveReady is True.
+	// +optional
+	Blocker *WaveBlocker `json:"blocker,omitempty"`
 }
 
 // EnvironmentStatus defines the observed state of Environment.

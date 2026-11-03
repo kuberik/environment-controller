@@ -241,6 +241,13 @@ func (r *GitHubEnvironmentReconciler) reconcileDuplicateSite(ctx context.Context
 		Environment: env.Spec.Environment,
 		Name:        ensureKuberikPrefix(env.Spec.Name),
 		Wave:        r.effectiveWave(env),
+		Blocker: &kuberikv1alpha1.WaveBlocker{
+			Reason:      ReasonDuplicateSite,
+			Environment: canonicalEnv(env.Spec.Environment),
+			Site:        site,
+			Names:       []string{env.Spec.Name},
+			Owner:       &kuberikv1alpha1.SiteOwner{Cluster: conflict.Cluster, Namespace: conflict.Namespace, Name: conflict.Name},
+		},
 	}
 	meta.SetStatusCondition(&env.Status.Conditions, metav1.Condition{
 		Type: ConditionWaveReady, Status: metav1.ConditionFalse, Reason: ReasonDuplicateSite,

@@ -411,6 +411,87 @@ spec:
                 description: Wave is set for Environments with a site and describes
                   their wave state.
                 properties:
+                  blocker:
+                    description: Blocker explains why the site is not Ready; nil when
+                      WaveReady is True.
+                    properties:
+                      environment:
+                        description: Environment is the canonical tier of the member
+                          waited on or at fault.
+                        type: string
+                      missingWaves:
+                        description: MissingWaves are the waves absent from the sequence
+                          (InvalidTopology, wave gap).
+                        items:
+                          format: int32
+                          type: integer
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      names:
+                        description: |-
+                          Names are the alias names registered for one tier (InvalidTopology), the
+                          offending name (UnknownTier), or, for DuplicateSite, names[0] is the
+                          deployment name the existing owner holds the site for.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      outcome:
+                        description: Outcome is set when a leader's bake ended badly.
+                        enum:
+                        - Failed
+                        - Cancelled
+                        type: string
+                      owner:
+                        description: Owner is the existing owner of the site (DuplicateSite).
+                        properties:
+                          cluster:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                        required:
+                        - cluster
+                        - name
+                        - namespace
+                        type: object
+                      pinnedVersion:
+                        description: PinnedVersion is the version the Rollout pins
+                          (Pinned).
+                        type: string
+                      reason:
+                        description: Reason is the WaveReady reason.
+                        type: string
+                      revision:
+                        description: Revision is the full revision concerned.
+                        type: string
+                      selectedVersion:
+                        description: SelectedVersion is the tag of the wave's pick
+                          (Pinned).
+                        type: string
+                      site:
+                        description: Site is the member waited on.
+                        type: string
+                      waitingOn:
+                        description: WaitingOn is what the wave waits for.
+                        enum:
+                        - Selection
+                        - Bake
+                        - Candidate
+                        - Sites
+                        type: string
+                      waves:
+                        description: Waves are the waves present (InvalidTopology,
+                          wave gap).
+                        items:
+                          format: int32
+                          type: integer
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    required:
+                    - reason
+                    type: object
                   environment:
                     description: |-
                       Environment is the environment name this site was registered under in

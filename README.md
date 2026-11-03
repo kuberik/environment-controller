@@ -144,6 +144,31 @@ When the wave-1 leader sets `lockstep: true`, its allowed set is pinned to the c
 | `LockstepConsistent` | `False` / `LockstepMismatch` | A member disagrees with the leader's `lockstep`. |
 | `Deprecated` | `True` / `RelationshipIgnored` | `spec.relationship` is set; it is ignored. Removed when the field is removed. |
 
+#### `status.wave.blocker`
+
+While `WaveReady` is `False`, `status.wave.blocker` carries the same blocker in structured form; it is absent when `WaveReady` is `True`. **The condition message is display text and may change; the blocker fields are the contract.** Do not parse messages.
+
+| Field | Meaning |
+| --- | --- |
+| `reason` | Same as the `WaveReady` reason. |
+| `environment` | Canonical tier of the member waited on, or of the faulty tier. |
+| `site` | The member waited on. Unset when no single member is meant. |
+| `waitingOn` | `Selection` (the leader has not selected), `Bake` (a member has not baked `revision`; with no `site`, sites exist but none baked a revision yet), `Candidate` (`revision` has no release-candidate tag), `Sites` (the environment has no registered sites). |
+| `outcome` | `Failed` or `Cancelled` when the leader's bake of `revision` ended badly. |
+| `revision` | Full revision concerned. |
+| `pinnedVersion`, `selectedVersion` | `Pinned`: the Rollout's pin and the wave's pick (tag). |
+| `owner` | `DuplicateSite`: `{cluster, namespace, name}` of the existing owner. |
+| `names` | `DuplicateSite`: `names[0]` is the deployment name the owner holds the site for. `InvalidTopology` alias case: the alias names. `UnknownTier`: the offending name. |
+| `waves`, `missingWaves` | `InvalidTopology` wave gap: waves present and absent. |
+
+```yaml
+status:
+  wave:
+    blocker: {reason: WaitingFor, environment: prod, site: us-east-1, waitingOn: Bake, revision: 1a2b3c4d...}
+```
+
+`LockstepMismatch` is reported only by the `LockstepConsistent` condition, not here.
+
 ### GitHub encoding
 
 The GitHub environment stays `kuberik/<name>/<environment>` and the task `deploy:kuberik/<name>` for every site. The deployment payload carries `site`, `wave`, `lockstep`, `selection` and `owner` (the last three omitted when empty). Deployments are matched by (history ID, environment, site, owner), because Rollout history IDs are per-cluster sequences. Statuses are posted with `auto_inactive: false` so one site's success does not deactivate another's. Per reconcile the controller lists at most 10 pages of 100 deployments per environment (self and upstream), keeps the newest 20 per site and fetches each of their statuses once (see "GitHub call budget").

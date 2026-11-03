@@ -550,6 +550,7 @@ func (r *GitHubEnvironmentReconciler) applyWaveStatus(ctx context.Context, env *
 		return a.Site < b.Site
 	})
 
+	ws.Blocker = waveBlockerStatus(dec.Blocker)
 	before := env.Status.DeepCopy()
 	env.Status.Wave = ws
 
@@ -816,4 +817,16 @@ func (r *GitHubEnvironmentReconciler) reconcileSiteChange(ctx context.Context, g
 		env.Status.Wave = &kuberikv1alpha1.WaveStatus{Site: cur.site, Environment: cur.environment, Name: cur.name, Wave: r.effectiveWave(env)}
 	}
 	return r.Status().Update(ctx, env)
+}
+
+// waveBlockerStatus maps the pure package's Blocker to the API type; nil in, nil out.
+func waveBlockerStatus(b *wave.Blocker) *kuberikv1alpha1.WaveBlocker {
+	if b == nil {
+		return nil
+	}
+	return &kuberikv1alpha1.WaveBlocker{
+		Reason: b.Reason, Environment: b.Environment, Site: b.Site, WaitingOn: b.WaitingOn,
+		Outcome: b.Outcome, Revision: b.Revision, PinnedVersion: b.PinnedVersion,
+		SelectedVersion: b.SelectedVersion, Waves: b.Waves, MissingWaves: b.MissingWaves, Names: b.Names,
+	}
 }

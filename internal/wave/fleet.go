@@ -142,10 +142,11 @@ func (f fleet) aliasConflict() *Blocker {
 		}
 		return names[i] < names[j]
 	})
-	canon, _ := Canonical(f.env)
+	tier := canon(f.env)
 	return &Blocker{Reason: ReasonInvalidTopology,
 		Message: fmt.Sprintf("%s are the same tier (%s); use one name per tier, sites/waves to split",
-			strings.Join(names[:len(names)-1], ", ")+" and "+names[len(names)-1], canon)}
+			strings.Join(names[:len(names)-1], ", ")+" and "+names[len(names)-1], tier),
+		Environment: tier, Names: names}
 }
 
 // aliasIndex is the position of name among the aliases of tier (canonical first).
@@ -169,6 +170,7 @@ func (f fleet) topology() *Blocker {
 		return nil
 	}
 	var missing []string
+	var missingN []int32
 	have := map[int32]bool{}
 	names := make([]string, 0, len(ws))
 	for _, w := range ws {
@@ -177,18 +179,21 @@ func (f fleet) topology() *Blocker {
 	}
 	if ws[0] < 1 {
 		return &Blocker{Reason: ReasonInvalidTopology,
-			Message: fmt.Sprintf("%s has waves %s (waves start at 1)", f.env, strings.Join(names, ","))}
+			Message:     fmt.Sprintf("%s has waves %s (waves start at 1)", f.env, strings.Join(names, ",")),
+			Environment: canon(f.env), Waves: ws}
 	}
 	for w := int32(1); w < ws[len(ws)-1]; w++ {
 		if !have[w] {
 			missing = append(missing, strconv.Itoa(int(w)))
+			missingN = append(missingN, w)
 		}
 	}
 	if len(missing) == 0 {
 		return nil
 	}
 	return &Blocker{Reason: ReasonInvalidTopology,
-		Message: fmt.Sprintf("%s has waves %s (missing %s)", f.env, strings.Join(names, ","), strings.Join(missing, ","))}
+		Message:     fmt.Sprintf("%s has waves %s (missing %s)", f.env, strings.Join(names, ","), strings.Join(missing, ",")),
+		Environment: canon(f.env), Waves: ws, MissingWaves: missingN}
 }
 
 // bakeOf is the bake of a member's newest deployment of rev, and that
@@ -363,17 +368,21 @@ func (f fleet) implicitSelection(w int32, st waveState) string {
 func (st waveState) blocker(env string) *Blocker {
 	for _, m := range st.reg {
 		if st.selRev == "" {
-			return &Blocker{Reason: ReasonWaitingFor, Message: env + "/" + m.Site + " bake"}
+			return &Blocker{Reason: ReasonWaitingFor, Message: env + "/" + m.Site + " bake",
+				Environment: canon(env), WaitingOn: WaitBake}
 		}
 		if !baked(m, st.selRev) {
-			return &Blocker{Reason: ReasonWaitingFor, Message: env + "/" + m.Site + " bake on " + short(st.selRev)}
+			return &Blocker{Reason: ReasonWaitingFor, Message: env + "/" + m.Site + " bake on " + short(st.selRev),
+				Environment: canon(env), Site: m.Site, WaitingOn: WaitBake, Revision: st.selRev}
 		}
 	}
 	if st.selRev != "" {
 		// Everyone baked it; the revision just has no tag.
-		return &Blocker{Reason: ReasonWaitingForCandidate, Message: short(st.selRev)}
+		return &Blocker{Reason: ReasonWaitingForCandidate, Message: short(st.selRev),
+			Environment: canon(env), WaitingOn: WaitCandidate, Revision: st.selRev}
 	}
-	return &Blocker{Reason: ReasonWaitingFor, Message: env + " has no registered sites"}
+	return &Blocker{Reason: ReasonWaitingFor, Message: env + " has no registered sites",
+		Environment: canon(env), WaitingOn: WaitSites}
 }
 
 // lockstepBlocker returns LockstepWaiting while any registered member of any
@@ -382,7 +391,8 @@ func (f fleet) lockstepBlocker(rev string) *Blocker {
 	for _, w := range f.registeredWaves() {
 		for _, m := range registered(f.byWave[w]) {
 			if !baked(m, rev) {
-				return &Blocker{Reason: ReasonLockstepWaiting, Message: f.env + "/" + m.Site + " bake on " + short(rev)}
+				return &Blocker{Reason: ReasonLockstepWaiting, Message: f.env + "/" + m.Site + " bake on " + short(rev),
+					Environment: canon(f.env), Site: m.Site, WaitingOn: WaitBake, Revision: rev}
 			}
 		}
 	}

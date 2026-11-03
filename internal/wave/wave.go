@@ -198,9 +198,46 @@ type Input struct {
 
 // Blocker explains why a site cannot progress. Message names the blocker, e.g.
 // "prod/us-east-1 bake on 1a2b3c4" or "prod has waves 1,3 (missing 2)".
+//
+// The remaining fields are the machine-readable form of the same blocker; they
+// are the contract, Message is display text. Only the fields meaningful for
+// Reason are set.
 type Blocker struct {
 	Reason  string
 	Message string
+
+	// Environment is the canonical tier of the member waited on or at fault.
+	Environment string
+	// Site is the member waited on.
+	Site string
+	// WaitingOn is one of WaitSelection, WaitBake, WaitCandidate or WaitSites.
+	WaitingOn string
+	// Outcome is BakeFailed or BakeCancelled when a leader's bake ended badly.
+	Outcome string
+	// Revision is the full revision concerned.
+	Revision string
+	// PinnedVersion is the Rollout's pin (Pinned).
+	PinnedVersion string
+	// SelectedVersion is the tag of the wave's pick (Pinned).
+	SelectedVersion string
+	// Waves and MissingWaves describe a wave gap (InvalidTopology).
+	Waves        []int32
+	MissingWaves []int32
+	// Names are the alias names (InvalidTopology) or the offending name (UnknownTier).
+	Names []string
+}
+
+// WaitingOn values.
+const (
+	WaitSelection = "Selection"
+	WaitBake      = "Bake"
+	WaitCandidate = "Candidate"
+	WaitSites     = "Sites"
+)
+
+func canon(name string) string {
+	c, _ := Canonical(name)
+	return c
 }
 
 // Decision is the outcome for Self.
@@ -234,7 +271,7 @@ func Decide(in Input) Decision {
 	// An environment outside the tier enum has no position in the order, so no
 	// upstream can be determined: fail closed rather than open the gate.
 	if Rank(s.Environment) < 0 {
-		return blocked(Decision{Role: RoleFollower}, &Blocker{Reason: ReasonUnknownTier, Message: UnknownTierMessage(s.Environment)})
+		return blocked(Decision{Role: RoleFollower}, &Blocker{Reason: ReasonUnknownTier, Message: UnknownTierMessage(s.Environment), Names: []string{s.Environment}})
 	}
 	sm, selfRegistered := selfMember(in)
 	own := newFleet(s.Environment, in.Members, sm, selfRegistered)
@@ -259,7 +296,7 @@ func Decide(in Input) Decision {
 	var up fleet
 	if s.Upstream != "" && s.Upstream == s.Environment {
 		return blocked(d, &Blocker{Reason: ReasonInvalidTopology,
-			Message: s.Environment + " is its own upstream"})
+			Message: s.Environment + " is its own upstream", Environment: canon(s.Environment)})
 	}
 	hasUpstream := s.Upstream != ""
 	if hasUpstream {
@@ -324,12 +361,14 @@ func decideFollower(d Decision, in Input, st waveState) Decision {
 	env := in.Self.Environment
 	d.AllowedTags = []string{}
 	if st.selRev == "" {
-		d.Blocker = &Blocker{Reason: ReasonWaitingFor, Message: env + "/" + st.leader + " selection"}
+		d.Blocker = &Blocker{Reason: ReasonWaitingFor, Message: env + "/" + st.leader + " selection",
+			Environment: canon(env), Site: st.leader, WaitingOn: WaitSelection}
 		return d
 	}
 	tag, ok := in.Candidates[st.selRev]
 	if !ok || tag == "" {
-		d.Blocker = &Blocker{Reason: ReasonWaitingForCandidate, Message: short(st.selRev)}
+		d.Blocker = &Blocker{Reason: ReasonWaitingForCandidate, Message: short(st.selRev),
+			Environment: canon(env), WaitingOn: WaitCandidate, Revision: st.selRev}
 		return d
 	}
 	// Like the former Alongside: when the leader's bake of the selection failed or was
@@ -341,13 +380,15 @@ func decideFollower(d Decision, in Input, st waveState) Decision {
 		}
 		if bake, _, ok := bakeOf(lm, st.selRev); ok && (bake == BakeFailed || bake == BakeCancelled) {
 			d.Blocker = &Blocker{Reason: ReasonWaitingFor,
-				Message: env + "/" + st.leader + " bake " + strings.ToLower(bake) + " on " + short(st.selRev)}
+				Message:     env + "/" + st.leader + " bake " + strings.ToLower(bake) + " on " + short(st.selRev),
+				Environment: canon(env), Site: st.leader, WaitingOn: WaitBake, Outcome: bake, Revision: st.selRev}
 			return d
 		}
 	}
 	d.AllowedTags = []string{tag}
 	if p := in.Self.PinnedVersion; p != "" && p != tag {
-		d.Blocker = &Blocker{Reason: ReasonPinned, Message: "pinned to " + p + ", wave selected " + tag}
+		d.Blocker = &Blocker{Reason: ReasonPinned, Message: "pinned to " + p + ", wave selected " + tag,
+			Environment: canon(env), PinnedVersion: p, SelectedVersion: tag, Revision: st.selRev}
 	}
 	return d
 }

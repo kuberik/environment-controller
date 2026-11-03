@@ -711,6 +711,9 @@ var _ = Describe("Sites and waves", func() {
 			first := mkEnv("eu", euSite, nil)
 			reconcile(first)
 			Expect(cond(first, ConditionWaveReady).Reason).NotTo(Equal(ReasonDuplicateSite))
+			if w := get(first).Status.Wave; w != nil {
+				Expect(w.Blocker).To(BeNil(), "blocker is cleared when not DuplicateSite")
+			}
 			owned := len(fake.deploymentsOf(prodGH))
 			Expect(owned).To(Equal(1))
 
@@ -733,6 +736,10 @@ var _ = Describe("Sites and waves", func() {
 				Expect(w.Wave).To(Equal(int32(1)))
 				Expect(w.Role).To(BeEmpty())
 				Expect(w.Members).To(BeEmpty())
+				Expect(w.Blocker).To(Equal(&kuberikv1alpha1.WaveBlocker{
+					Reason: ReasonDuplicateSite, Environment: "prod", Site: euSite, Names: []string{wApp},
+					Owner: &kuberikv1alpha1.SiteOwner{Cluster: "cluster-self", Namespace: ns1, Name: "eu"},
+				}))
 			})
 			Expect(fake.postCount()).To(Equal(before))
 			Expect(fake.deploymentsOf(prodGH)).To(HaveLen(owned))

@@ -56,6 +56,15 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        env:
+        # Default site for Environments without spec.site. Optional ConfigMap, the
+        # same one rollout-dashboard reads; unset means site-less behaviour.
+        - name: SITE
+          valueFrom:
+            configMapKeyRef:
+              name: kuberik-cluster-info
+              key: site
+              optional: true
         ports: []
         securityContext:
           readOnlyRootFilesystem: true

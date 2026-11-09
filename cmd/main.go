@@ -61,6 +61,8 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	var defaultSite string
+	var maxConcurrentReconciles int
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -84,6 +86,10 @@ func main() {
 		"The directory that contains the metrics server certificate.")
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
+	flag.StringVar(&defaultSite, "default-site", os.Getenv("SITE"),
+		"The site used by Environments that do not set spec.site. Defaults to $SITE. When empty the site is \"default\".")
+	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 4,
+		"Number of Environments reconciled in parallel.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
@@ -191,9 +197,13 @@ func main() {
 	cacheTransport := ghcache.NewMemCache(baseTransport, 10, ghcache.NewRequestThrottlingTimes(0, 0, 0, 0, 0))
 
 	if err := (&controller.GitHubEnvironmentReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		CacheTransport: cacheTransport,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		CacheTransport:          cacheTransport,
+		APIReader:               mgr.GetAPIReader(),
+		DefaultSite:             defaultSite,
+		MaxConcurrentReconciles: maxConcurrentReconciles,
+		Recorder:                mgr.GetEventRecorderFor("environment-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Environment")
 		os.Exit(1)

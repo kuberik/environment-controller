@@ -164,7 +164,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 			// This test documents how relevantVersions works:
 			// 1. relevantVersions is built from ALL history entries in ALL relevant environments
 			// 2. It's a set of revision SHAs that appear in any relevant environment's history
-			// 3. It's used to determine which versions are relevant across the relationship graph
+			// 3. It's used to determine which versions are relevant across the environment tiers
 			// 4. However, it's NOT used to filter history in environmentInfos - each environment keeps ALL its own history
 
 			revision1 := "rev1"
@@ -172,7 +172,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 			revision3 := "rev3"
 			revision4 := "rev4"
 
-			// Simulate relationship graph data
+			// Simulate environment graph data
 			envHistory := map[string][]kuberikrolloutv1alpha1.DeploymentHistoryEntry{
 				"dev": {
 					{
@@ -224,7 +224,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 				"prod":    false, // Not relevant
 			}
 
-			// Build relevantVersions (simulating the logic from buildRelationshipGraph)
+			// Build relevantVersions (simulating the logic from buildEnvironmentGraph)
 			relevantVersions := make(map[string]bool)
 			for envName, history := range envHistory {
 				if !relevantEnvironments[envName] {
@@ -305,10 +305,6 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 			existingStagingInfo := kuberikv1alpha1.EnvironmentInfo{
 				Environment:    "staging",
 				EnvironmentURL: "https://staging.example.com",
-				Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-					Environment: "dev",
-					Type:        kuberikv1alpha1.RelationshipTypeAfter,
-				},
 				History: []kuberikrolloutv1alpha1.DeploymentHistoryEntry{
 					{
 						ID: k8sptr.To(int64(25)),
@@ -394,8 +390,6 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 				if info.Environment == "staging" {
 					stagingFound = true
 					Expect(info.EnvironmentURL).To(Equal("https://staging.example.com"))
-					Expect(info.Relationship).ToNot(BeNil())
-					Expect(info.Relationship.Environment).To(Equal("dev"))
 					Expect(info.History).To(HaveLen(1))
 					Expect(*info.History[0].Version.Revision).To(Equal("staging-rev-25"))
 					break
@@ -415,9 +409,9 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 			Expect(devFound).To(BeTrue())
 		})
 
-		It("Should sort environmentInfos by relationship (ancestor first)", func() {
+		It("Should sort environmentInfos by tier (earliest first)", func() {
 			// This test verifies that buildEnvironmentInfos (called via updateStatus)
-			// sorts environmentInfos topologically: ancestor -> descendant
+			// sorts environmentInfos by tier order: dev -> staging -> prod
 
 			environment := &kuberikv1alpha1.Environment{
 				ObjectMeta: metav1.ObjectMeta{
@@ -438,21 +432,11 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 				},
 			}
 
-			graphData := &relationshipGraphData{
+			graphData := &environmentGraphData{
 				environmentInfos: map[string]environmentInfo{
-					"prod": {
-						Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-							Environment: "staging",
-							Type:        kuberikv1alpha1.RelationshipTypeAfter,
-						},
-					},
-					"dev": {},
-					"staging": {
-						Relationship: &kuberikv1alpha1.EnvironmentRelationship{
-							Environment: "dev",
-							Type:        kuberikv1alpha1.RelationshipTypeAfter,
-						},
-					},
+					"prod":    {},
+					"dev":     {},
+					"staging": {},
 				},
 				envHistory: map[string][]kuberikrolloutv1alpha1.DeploymentHistoryEntry{
 					"dev":     {{ID: k8sptr.To(int64(10))}},
@@ -481,19 +465,19 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 				{ID: k8sptr.To(int64(20))},
 			}
 
-			result := updateEnvironmentInfoWithHistory(infos, "dev", "url", nil, history)
+			result := updateEnvironmentInfoWithHistory(infos, "dev", "url", history)
 			Expect(result).To(HaveLen(1))
 			Expect(result[0].History[0].ID).To(Equal(k8sptr.To(int64(30))))
 			Expect(result[0].History[1].ID).To(Equal(k8sptr.To(int64(20))))
 			Expect(result[0].History[2].ID).To(Equal(k8sptr.To(int64(10))))
 		})
 
-		It("Should handle complex branching (dev -> staging, dev -> test, staging -> prod)", func() {
-			graphData := &relationshipGraphData{
+		It("Should order the tiers dev, test, staging, prod regardless of history IDs", func() {
+			graphData := &environmentGraphData{
 				environmentInfos: map[string]environmentInfo{
-					"prod":    {Relationship: &kuberikv1alpha1.EnvironmentRelationship{Environment: "staging", Type: "after"}},
-					"staging": {Relationship: &kuberikv1alpha1.EnvironmentRelationship{Environment: "dev", Type: "after"}},
-					"test":    {Relationship: &kuberikv1alpha1.EnvironmentRelationship{Environment: "dev", Type: "after"}},
+					"prod":    {},
+					"staging": {},
+					"test":    {},
 					"dev":     {},
 				},
 				envHistory: map[string][]kuberikrolloutv1alpha1.DeploymentHistoryEntry{
@@ -509,20 +493,18 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 					Name:      "complex-env",
 					Namespace: "default",
 				},
+				Spec: kuberikv1alpha1.EnvironmentSpec{Environment: "dev", Name: "complex-env", RolloutRef: corev1.LocalObjectReference{Name: "r"}, Backend: kuberikv1alpha1.BackendConfig{Type: "github", Project: "o/r"}},
 			}
 			Expect(reconciler.Create(context.Background(), env)).To(Succeed())
 
 			err := reconciler.updateStatus(context.Background(), env, graphData)
 			Expect(err).ToNot(HaveOccurred())
 
-			// dev should be first. staging/test are both after dev.
-			// staging (20) vs test (15) -> staging comes first
-			// prod is after staging -> prod must be after staging
-			// prod (30) vs test (15) -> prod comes before test
+			// Tier order wins over history IDs (prod has the highest ID but comes last).
 			Expect(env.Status.EnvironmentInfos[0].Environment).To(Equal("dev"))
-			Expect(env.Status.EnvironmentInfos[1].Environment).To(Equal("staging"))
-			Expect(env.Status.EnvironmentInfos[2].Environment).To(Equal("prod"))
-			Expect(env.Status.EnvironmentInfos[3].Environment).To(Equal("test"))
+			Expect(env.Status.EnvironmentInfos[1].Environment).To(Equal("test"))
+			Expect(env.Status.EnvironmentInfos[2].Environment).To(Equal("staging"))
+			Expect(env.Status.EnvironmentInfos[3].Environment).To(Equal("prod"))
 		})
 
 		It("Should select CurrentVersion by highest history ID", func() {
@@ -539,7 +521,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 			}
 			Expect(reconciler.Create(context.Background(), environment)).To(Succeed())
 
-			graphData := &relationshipGraphData{
+			graphData := &environmentGraphData{
 				environmentInfos: map[string]environmentInfo{
 					environment.Name: {},
 				},
@@ -571,7 +553,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 				{ID: k8sptr.To(int64(20))},
 			}
 
-			infos := updateEnvironmentInfoWithHistory(nil, "dev", "https://dev.com", nil, history)
+			infos := updateEnvironmentInfoWithHistory(nil, "dev", "https://dev.com", history)
 
 			Expect(infos).To(HaveLen(1))
 			Expect(infos[0].History).To(HaveLen(3))
@@ -595,7 +577,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 				{ID: k8sptr.To(int64(15))},
 			}
 
-			infos = updateEnvironmentInfoWithHistory(infos, "dev", "https://dev-updated.com", nil, newHistory)
+			infos = updateEnvironmentInfoWithHistory(infos, "dev", "https://dev-updated.com", newHistory)
 
 			Expect(infos).To(HaveLen(1))
 			Expect(infos[0].EnvironmentURL).To(Equal("https://dev-updated.com"))
@@ -606,7 +588,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 	})
 
 	Context("updateStatus sorting via buildEnvironmentInfos", func() {
-		It("Should sort environmentInfos alphabetically by name", func() {
+		It("Should sort environmentInfos by tier order, not alphabetically", func() {
 			environment := &kuberikv1alpha1.Environment{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-env",
@@ -616,7 +598,7 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 				},
 			}
 
-			graphData := &relationshipGraphData{
+			graphData := &environmentGraphData{
 				environmentInfos: map[string]environmentInfo{
 					"prod":    {EnvironmentURL: "https://prod.com"},
 					"dev":     {EnvironmentURL: "https://dev.com"},
@@ -637,8 +619,8 @@ var _ = Describe("GitHub Environment Controller Unit Tests", func() {
 
 			Expect(environment.Status.EnvironmentInfos).To(HaveLen(3))
 			Expect(environment.Status.EnvironmentInfos[0].Environment).To(Equal("dev"))
-			Expect(environment.Status.EnvironmentInfos[1].Environment).To(Equal("prod"))
-			Expect(environment.Status.EnvironmentInfos[2].Environment).To(Equal("staging"))
+			Expect(environment.Status.EnvironmentInfos[1].Environment).To(Equal("staging"))
+			Expect(environment.Status.EnvironmentInfos[2].Environment).To(Equal("prod"))
 		})
 	})
 })

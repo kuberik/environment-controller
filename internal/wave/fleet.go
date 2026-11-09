@@ -1,0 +1,430 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package wave
+
+import (
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+// fleet is the members of one environment grouped by wave. Deregistered
+// members are kept (their selection records still count).
+type fleet struct {
+	env    string
+	byWave map[int32][]Member
+	// unseenSelf is Self's site when the backend does not count it yet.
+	unseenSelf string
+}
+
+// selfMember builds Self as a member of its spec wave, keeping the deployments
+// recorded for it in the backend (stamped with the wave they were recorded in).
+// registered reports whether the backend already counts Self as a member.
+func selfMember(in Input) (self *Member, registered bool) {
+	s := in.Self
+	m := Member{Environment: s.Environment, Alias: s.Alias, Site: s.Site, Wave: s.Wave, Lockstep: s.Lockstep}
+	for _, o := range in.Members {
+		if o.Environment == s.Environment && o.Site == s.Site {
+			m.Deployments = stampWave(o.Deployments, o.Wave)
+			registered = !o.Deregistered
+			break
+		}
+	}
+	return &m, registered
+}
+
+// stampWave returns deps with an unknown (0) Wave replaced by the member's
+// recorded wave.
+func stampWave(deps []Deployment, wave int32) []Deployment {
+	out := make([]Deployment, len(deps))
+	for i, d := range deps {
+		if d.Wave == 0 {
+			d.Wave = wave
+		}
+		out[i] = d
+	}
+	return out
+}
+
+// newFleet groups the members of env by wave. self, when given, replaces any
+// recorded entry for its site; selfRegistered says whether the backend
+// already sees it (an unseen Self may not out-rank registered members).
+func newFleet(env string, members []Member, self *Member, selfRegistered bool) fleet {
+	f := fleet{env: env, byWave: map[int32][]Member{}}
+	seen := map[string]bool{}
+	if self != nil {
+		seen[self.Site] = true
+		f.byWave[self.Wave] = append(f.byWave[self.Wave], *self)
+		if !selfRegistered {
+			f.unseenSelf = self.Site
+		}
+	}
+	for _, m := range members {
+		if m.Environment != env || seen[m.Site] {
+			continue
+		}
+		seen[m.Site] = true
+		m.Deployments = stampWave(m.Deployments, m.Wave)
+		f.byWave[m.Wave] = append(f.byWave[m.Wave], m)
+	}
+	return f
+}
+
+func registered(ms []Member) []Member {
+	var out []Member
+	for _, m := range ms {
+		if !m.Deregistered {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Site < out[j].Site })
+	return out
+}
+
+// registeredWaves returns the sorted waves with at least one registered member.
+func (f fleet) registeredWaves() []int32 {
+	var ws []int32
+	for w, ms := range f.byWave {
+		if len(registered(ms)) > 0 {
+			ws = append(ws, w)
+		}
+	}
+	sort.Slice(ws, func(i, j int) bool { return ws[i] < ws[j] })
+	return ws
+}
+
+func (f fleet) lastWave() int32 {
+	ws := f.registeredWaves()
+	if len(ws) == 0 {
+		return 0
+	}
+	return ws[len(ws)-1]
+}
+
+// aliasConflict returns InvalidTopology when registered members of one tier are
+// written under different alias names (staging and preprod): they are the same
+// tier and must not be merged silently into one chain.
+func (f fleet) aliasConflict() *Blocker {
+	seen := map[string]bool{}
+	for _, ms := range f.byWave {
+		for _, m := range registered(ms) {
+			if m.Alias != "" {
+				seen[m.Alias] = true
+			}
+		}
+	}
+	if len(seen) < 2 {
+		return nil
+	}
+	names := make([]string, 0, len(seen))
+	for a := range seen {
+		names = append(names, a)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		ai, aj := aliasIndex(f.env, names[i]), aliasIndex(f.env, names[j])
+		if ai != aj {
+			return ai < aj
+		}
+		return names[i] < names[j]
+	})
+	tier := canon(f.env)
+	return &Blocker{Reason: ReasonInvalidTopology,
+		Message: fmt.Sprintf("%s are the same tier (%s); use one name per tier, sites/waves to split",
+			strings.Join(names[:len(names)-1], ", ")+" and "+names[len(names)-1], tier),
+		Environment: tier, Names: names}
+}
+
+// aliasIndex is the position of name among the aliases of tier (canonical first).
+func aliasIndex(tier, name string) int {
+	for i, a := range Aliases(tier) {
+		if a == name {
+			return i
+		}
+	}
+	return len(tiers)
+}
+
+// topology returns InvalidTopology when the registered waves are not 1..max, or
+// when one tier is registered under several names.
+func (f fleet) topology() *Blocker {
+	if b := f.aliasConflict(); b != nil {
+		return b
+	}
+	ws := f.registeredWaves()
+	if len(ws) == 0 {
+		return nil
+	}
+	var missing []string
+	var missingN []int32
+	have := map[int32]bool{}
+	names := make([]string, 0, len(ws))
+	for _, w := range ws {
+		have[w] = true
+		names = append(names, strconv.Itoa(int(w)))
+	}
+	if ws[0] < 1 {
+		return &Blocker{Reason: ReasonInvalidTopology,
+			Message:     fmt.Sprintf("%s has waves %s (waves start at 1)", f.env, strings.Join(names, ",")),
+			Environment: canon(f.env), Waves: ws}
+	}
+	for w := int32(1); w < ws[len(ws)-1]; w++ {
+		if !have[w] {
+			missing = append(missing, strconv.Itoa(int(w)))
+			missingN = append(missingN, w)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return &Blocker{Reason: ReasonInvalidTopology,
+		Message:     fmt.Sprintf("%s has waves %s (missing %s)", f.env, strings.Join(names, ","), strings.Join(missing, ",")),
+		Environment: canon(f.env), Waves: ws, MissingWaves: missingN}
+}
+
+// bakeOf is the bake of a member's newest deployment of rev, and that
+// deployment's Order. ok is false when the member never deployed rev.
+func bakeOf(m Member, rev string) (bake string, order int64, ok bool) {
+	for _, d := range m.Deployments {
+		// Equal Order (illegal duplicate input): the non-Succeeded copy wins.
+		if d.Revision == rev && (!ok || d.Order > order || (d.Order == order && d.Bake != BakeSucceeded)) {
+			bake, order, ok = d.Bake, d.Order, true
+		}
+	}
+	return
+}
+
+func baked(m Member, rev string) bool {
+	b, _, ok := bakeOf(m, rev)
+	return ok && b == BakeSucceeded
+}
+
+func allBaked(ms []Member, rev string) bool {
+	if len(ms) == 0 {
+		return false
+	}
+	for _, m := range ms {
+		if !baked(m, rev) {
+			return false
+		}
+	}
+	return true
+}
+
+// completedRevs maps every revision baked Succeeded by all of ms to the
+// highest Order among the members' deployments of it.
+func completedRevs(ms []Member) map[string]int64 {
+	out := map[string]int64{}
+	if len(ms) == 0 {
+		return out
+	}
+	for _, d := range ms[0].Deployments {
+		if _, done := out[d.Revision]; done || !allBaked(ms, d.Revision) {
+			continue
+		}
+		var max int64
+		for _, m := range ms {
+			_, o, _ := bakeOf(m, d.Revision)
+			if o > max {
+				max = o
+			}
+		}
+		out[d.Revision] = max
+	}
+	return out
+}
+
+// tagList maps revisions to tags (dropping those without one), newest first,
+// ties by tag, no duplicates. Never nil.
+func tagList(revs map[string]int64, cand map[string]string) []string {
+	byTag := map[string]int64{}
+	for r, o := range revs {
+		t, ok := cand[r]
+		if !ok || t == "" {
+			continue
+		}
+		if cur, seen := byTag[t]; !seen || o > cur {
+			byTag[t] = o
+		}
+	}
+	out := make([]string, 0, len(byTag))
+	for t := range byTag {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if byTag[out[i]] != byTag[out[j]] {
+			return byTag[out[i]] > byTag[out[j]]
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+func short(rev string) string {
+	if len(rev) > 7 {
+		return rev[:7]
+	}
+	return rev
+}
+
+// waveState is the computed state of one (environment, wave).
+type waveState struct {
+	reg      []Member // registered, sorted by site
+	leader   string
+	selRev   string // current selection (explicit, else implicit)
+	explicit bool
+}
+
+func (f fleet) state(w int32) waveState {
+	all := f.byWave[w]
+	st := waveState{reg: registered(all)}
+	if len(st.reg) == 0 {
+		return st
+	}
+	var selSite string
+	st.selRev, selSite, st.explicit = f.selection(w)
+	st.leader = st.reg[0].Site
+	if st.reg[0].Site == f.unseenSelf && len(st.reg) > 1 {
+		st.leader = st.reg[1].Site
+	}
+	if st.explicit {
+		for _, m := range st.reg {
+			if m.Site == selSite && m.Site != f.unseenSelf && !allBaked(st.reg, st.selRev) {
+				st.leader = selSite
+			}
+		}
+		return st
+	}
+	// Implicit selection: the computed leader's newest deployment. In waves
+	// after the first it only counts once the previous wave completed it, so
+	// a migration cannot leak an ungated revision into a later wave.
+	st.selRev = f.implicitSelection(w, st)
+	return st
+}
+
+// selection returns the newest selection record written in wave w by any
+// member (moved or deregistered members included). Ties on Order go to the
+// lower site.
+func (f fleet) selection(w int32) (rev, site string, ok bool) {
+	var order int64
+	for _, ms := range f.byWave {
+		for _, m := range ms {
+			for _, d := range m.Deployments {
+				if !d.Selection || d.Wave != w {
+					continue
+				}
+				if !ok || d.Order > order || (d.Order == order && m.Site < site) {
+					ok, order, rev, site = true, d.Order, d.Revision, m.Site
+				}
+			}
+		}
+	}
+	return rev, site, ok
+}
+
+// implicitSelection is the computed leader's newest deployment. In waves after
+// the first it only counts once the previous wave completed it, so a migration
+// cannot leak an ungated revision into a later wave.
+func (f fleet) implicitSelection(w int32, st waveState) string {
+	var newest Deployment
+	found := false
+	for _, m := range st.reg {
+		if m.Site != st.leader {
+			continue
+		}
+		for _, d := range m.Deployments {
+			if !found || d.Order > newest.Order {
+				newest, found = d, true
+			}
+		}
+	}
+	if !found {
+		return ""
+	}
+	if w > 1 {
+		if _, done := completedRevs(f.state(w - 1).reg)[newest.Revision]; !done {
+			return ""
+		}
+	}
+	return newest.Revision
+}
+
+// blocker names the first registered member (by site) that has not baked the
+// wave's current selection.
+func (st waveState) blocker(env string) *Blocker {
+	for _, m := range st.reg {
+		if st.selRev == "" {
+			return &Blocker{Reason: ReasonWaitingFor, Message: env + "/" + m.Site + " bake",
+				Environment: canon(env), WaitingOn: WaitBake}
+		}
+		if !baked(m, st.selRev) {
+			return &Blocker{Reason: ReasonWaitingFor, Message: env + "/" + m.Site + " bake on " + short(st.selRev),
+				Environment: canon(env), Site: m.Site, WaitingOn: WaitBake, Revision: st.selRev}
+		}
+	}
+	if st.selRev != "" {
+		// Everyone baked it; the revision just has no tag.
+		return &Blocker{Reason: ReasonWaitingForCandidate, Message: short(st.selRev),
+			Environment: canon(env), WaitingOn: WaitCandidate, Revision: st.selRev}
+	}
+	return &Blocker{Reason: ReasonWaitingFor, Message: env + " has no registered sites",
+		Environment: canon(env), WaitingOn: WaitSites}
+}
+
+// lockstepBlocker returns LockstepWaiting while any registered member of any
+// wave has not baked rev; members are ordered by (wave, site).
+func (f fleet) lockstepBlocker(rev string) *Blocker {
+	for _, w := range f.registeredWaves() {
+		for _, m := range registered(f.byWave[w]) {
+			if !baked(m, rev) {
+				return &Blocker{Reason: ReasonLockstepWaiting, Message: f.env + "/" + m.Site + " bake on " + short(rev),
+					Environment: canon(f.env), Site: m.Site, WaitingOn: WaitBake, Revision: rev}
+			}
+		}
+	}
+	return nil
+}
+
+// mismatch reports registered members whose Lockstep differs from the wave-1
+// leader's.
+func (f fleet) mismatch() *Blocker {
+	st := f.state(1)
+	if len(st.reg) == 0 {
+		return nil
+	}
+	var want bool
+	for _, m := range st.reg {
+		if m.Site == st.leader {
+			want = m.Lockstep
+		}
+	}
+	var bad []string
+	for _, w := range f.registeredWaves() {
+		for _, m := range registered(f.byWave[w]) {
+			if m.Lockstep != want {
+				bad = append(bad, f.env+"/"+m.Site)
+			}
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	sort.Strings(bad)
+	return &Blocker{Reason: ReasonLockstepMismatch,
+		Message: fmt.Sprintf("wave-1 leader %s/%s has lockstep=%t; disagreeing sites: %s",
+			f.env, st.leader, want, strings.Join(bad, ", "))}
+}

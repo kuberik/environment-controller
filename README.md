@@ -1,12 +1,13 @@
 # Environment Controller
 
-A Kubernetes controller for managing environments and their relationships across different backends. Currently implements GitHub backend integration that reports deployment status to GitHub's Deployments API and manages environment relationships.
+A Kubernetes controller that orders environments by fixed tiers (dev, test, staging, prod) and rolls each environment out across sites and waves, across different backends. Currently implements GitHub backend integration that reports deployment status to GitHub's Deployments API and derives rollout gates from it.
 
 ## Features
 
 - **Multi-Backend Support**: Generic Environment API that can support multiple backends (currently GitHub)
 - **GitHub Deployment Integration**: Creates and manages GitHub deployments for Environment resources
-- **Relationship Management**: Manages environment relationships between environments (After, Alongside)
+- **Tier Ordering**: Environments are gated by a fixed tier order (dev, test, staging, prod); no per-object configuration
+- **Sites and Waves**: One environment can run in several clusters (sites) that roll out in ordered waves, one owner per site
 - **Status Reporting**: Reports deployment status back to GitHub Deployments API
 - **Automatic RolloutGate Creation**: Automatically creates and manages RolloutGate resources
 
@@ -44,13 +45,12 @@ spec:
 
   # Environment configuration
   name: "kuberik-myapp-production"
-  environment: "production"
+  environment: "prod"
   ref: "main"
 
-  # Relationship configuration
-  relationship:
-    type: "After"
-    environment: "staging"
+  # Optional: which cluster instance this is, and its rollout wave
+  site: "eu-west-1"   # defaults to the controller's default site, then "default"
+  wave: 1             # defaults to 1
 
   # Backend-specific configuration
   backend:
@@ -65,6 +65,7 @@ spec:
 
 - `rolloutRef`: Reference to the Rollout resource
 - `name`: Name of the deployment (the "kuberik" prefix will be automatically added for GitHub backend)
+- `environment`: The tier of this environment, one of `dev`, `development`, `test`, `qa`, `staging`, `stage`, `preprod`, `prod`, `production` (see [Tier ordering](#tier-ordering)). Other values are rejected by validation.
 - `backend`: Backend-specific configuration
   - `type`: Backend type (currently only "github" is supported)
   - `project`: Project identifier (for GitHub: "owner/repo")
@@ -72,12 +73,169 @@ spec:
 
 ### Optional Fields
 
-- `environment`: Environment name (e.g., "production", "staging")
 - `ref`: Git reference (branch, tag, or SHA) - defaults to the revision from Rollout history
-- `relationship`: Defines relationship to other environments
-  - `type`: "After" or "Alongside" (see [Environment Relationships](#environment-relationships))
-  - `environment`: Environment name this deployment relates to
+- `site`: Name of this cluster's instance of the environment (see [Sites and waves](#sites-and-waves)). Defaults to the controller's default site, then `default`.
+- `wave`: 1-based wave of this site inside its environment. Defaults to 1.
+- `lockstep`: See [Lockstep](#lockstep).
 - `requeueInterval`: Interval for reconciliation (default: "1m")
+- `relationship`: **Deprecated and ignored.** Environment order is fixed. Still accepted so existing manifests keep applying; the Environment reports `Deprecated=True` with reason `RelationshipIgnored`. It will be removed in a later release.
+
+## Tier ordering
+
+Environments are ordered by fixed tiers, earliest first: `dev` < `test` < `staging` < `prod`. `spec.environment` accepts these names, where the aliases are the same environment as their canonical tier everywhere (wave grouping, upstream lookup, GitHub matching):
+
+| Tier (canonical) | Accepted names |
+| --- | --- |
+| 1 | `dev`, `development` |
+| 2 | `test`, `qa` |
+| 3 | `staging`, `stage`, `preprod` |
+| 4 | `prod`, `production` |
+
+An Environment is gated on its **upstream**: the last wave of the nearest earlier tier that is present in GitHub for the same deployment name. Tiers that are not present are skipped, so `prod` is gated on `staging` when there is no `test`, and `dev` has no upstream. Presence is read from GitHub, not from the cluster, so the upstream environment may live in another cluster.
+
+## Sites and waves
+
+One logical environment (`prod`) can run in several clusters. Each cluster's instance is a **site**; sites of one environment roll out in ordered **waves**. All coordination happens through GitHub deployments, so clusters never talk to each other.
+
+### Fields
+
+| Field | Meaning |
+| --- | --- |
+| `spec.site` | Name of this cluster's instance (`eu-west-1`). Max 63 chars, `[A-Za-z0-9._-]`. |
+| `spec.wave` | 1-based wave of this site inside its environment. Defaults to 1. |
+| `spec.lockstep` | If true on the wave-1 leader, no new version is selected until every wave baked the current one. |
+
+The effective site is `spec.site`, else the controller's default site (flag `--default-site`, which defaults to `$SITE`; the manager Deployment fills `SITE` from the optional ConfigMap `kuberik-cluster-info`, key `site`, the same ConfigMap rollout-dashboard reads), else the literal `default`. The effective wave is `spec.wave`, else 1. Every Environment is therefore sited: it always carries the deregister finalizer, `status.wave` and the wave conditions.
+
+Deployments in GitHub written before sites existed have no site in their payload. They count as site `default`, wave 1, so a single-cluster setup continues its history. Those legacy deployments stay a live member `default` of their tier until a marker deregisters it. An Environment that was reconciled as `default` and then moves to another site (spec.site, or the cluster default site plus a controller restart) deregisters `default` itself. If the upgraded controller starts with a non-`default` site straight away (for example `SITE=eu-west-1` already set), nothing deregisters `default`: it stays a phantom wave-1 member that leads the wave and never bakes new versions, so the next tier stalls. Upgrade with the site unset first, let every Environment reconcile once, then set the site.
+
+### Leader rule
+
+Within `(environment, wave)` one site is the **leader** and writes the *selection record*: a GitHub deployment whose payload has `selection: true`. The leader is the lexicographically lowest registered site, but it is sticky while a selection is in flight: a lower-sorting site registering mid-rollout does not take over. Followers deploy exactly the newest selection record of their wave and do not wait for the leader's bake.
+
+The `selection` flag on a deployment records the role from the *previous* gate decision (`status.wave.role`), because the deployment is written after the Rollout already acted on the gate. A leader's very first deployment therefore carries no flag yet; it acts as an implicit selection until the next reconcile records `Leader`, after which new deployments are flagged.
+
+### Allowed versions
+
+- Wave-1 leader: versions that completed the upstream environment (see [Tier ordering](#tier-ordering)): baked successfully by every registered member of the upstream's last wave. No upstream: unrestricted (the gate's `allowedVersions` is unset).
+- Wave-N leader (N>1): versions baked successfully by every registered member of wave N-1.
+- Follower: exactly the current selection of its wave.
+- Revisions are mapped to tags via the Rollout's `releaseCandidates`; a revision without a tag is dropped.
+- The waves of an environment must be exactly `1..max`; a gap blocks everything.
+
+### Lockstep
+
+When the wave-1 leader sets `lockstep: true`, its allowed set is pinned to the current selection until every registered member of every wave baked it successfully. Members that disagree with the leader's value surface `LockstepConsistent=False`; the leader's value governs.
+
+### Status and conditions
+
+`status.wave` records site, wave, role (`Leader`/`Follower`), leader, selected revision and the observed members. It is written before the RolloutGate is updated. Every Environment gets these conditions (`Deprecated` only while `spec.relationship` is set):
+
+| Condition | Status / Reason | Meaning |
+| --- | --- | --- |
+| `WaveReady` | `True` / `Ready` | The site may deploy the allowed versions. |
+| `WaveReady` | `False` / `WaitingFor` | Waiting for a named member to bake (message names it). Also set on a follower when the leader's bake of the selected revision is Failed or Cancelled (`prod/us-east-1 bake failed on 1a2b3c4`): the version drops out of the follower's gate, and a follower that has not started it gets an empty gate. A follower that already started it keeps going. |
+| `WaveReady` | `False` / `DuplicateSite` | Another Environment owns this deployment name + tier + site (message names the owner). See [One owner per site](#one-owner-per-site). |
+| `WaveReady` | `False` / `WaitingForCandidate` | The wanted revision has no release-candidate tag yet. |
+| `WaveReady` | `False` / `Pinned` | The Rollout pins `spec.wantedVersion`. |
+| `WaveReady` | `False` / `UnknownTier` | `spec.environment` is not one of the nine tier names (only possible for objects that predate the enum). The gate is closed (`allowedVersions: []`); the message names the value and the accepted names. |
+| `WaveReady` | `False` / `InvalidTopology` | Waves have a gap (this or the upstream environment), or one tier is registered under two names (`staging and preprod are the same tier (staging); use one name per tier, sites/waves to split`). The gate is closed for every Environment that sees both. |
+| `WaveReady` | `False` / `LockstepWaiting` | Lockstep holds the leader on the current selection. |
+| `LockstepConsistent` | `False` / `LockstepMismatch` | A member disagrees with the leader's `lockstep`. |
+| `Deprecated` | `True` / `RelationshipIgnored` | `spec.relationship` is set; it is ignored. Removed when the field is removed. |
+
+#### `status.wave.blocker`
+
+While `WaveReady` is `False`, `status.wave.blocker` carries the same blocker in structured form; it is absent when `WaveReady` is `True`. **The condition message is display text and may change; the blocker fields are the contract.** Do not parse messages.
+
+| Field | Meaning |
+| --- | --- |
+| `reason` | Same as the `WaveReady` reason. |
+| `environment` | Canonical tier of the member waited on, or of the faulty tier. |
+| `site` | The member waited on. Unset when no single member is meant. |
+| `waitingOn` | `Selection` (the leader has not selected), `Bake` (a member has not baked `revision`; with no `site`, sites exist but none baked a revision yet), `Candidate` (`revision` has no release-candidate tag), `Sites` (the environment has no registered sites). |
+| `outcome` | `Failed` or `Cancelled` when the leader's bake of `revision` ended badly. |
+| `revision` | Full revision concerned. |
+| `pinnedVersion`, `selectedVersion` | `Pinned`: the Rollout's pin and the wave's pick (tag). |
+| `owner` | `DuplicateSite`: `{cluster, namespace, name}` of the existing owner. |
+| `names` | `DuplicateSite`: `names[0]` is the deployment name the owner holds the site for. `InvalidTopology` alias case: the alias names. `UnknownTier`: the offending name. |
+| `waves`, `missingWaves` | `InvalidTopology` wave gap: waves present and absent. |
+
+```yaml
+status:
+  wave:
+    blocker: {reason: WaitingFor, environment: prod, site: us-east-1, waitingOn: Bake, revision: 1a2b3c4d...}
+```
+
+`LockstepMismatch` is reported only by the `LockstepConsistent` condition, not here.
+
+### GitHub encoding
+
+The GitHub environment stays `kuberik/<name>/<environment>` and the task `deploy:kuberik/<name>` for every site. The deployment payload carries `site`, `wave`, `lockstep`, `selection` and `owner` (the last three omitted when empty). Deployments are matched by (history ID, environment, site, owner), because Rollout history IDs are per-cluster sequences. Statuses are posted with `auto_inactive: false` so one site's success does not deactivate another's. Per reconcile the controller lists at most 10 pages of 100 deployments per environment (self and upstream), keeps the newest 20 per site and fetches each of their statuses once (see "GitHub call budget").
+
+### One owner per site
+
+Exactly one Environment may own a deployment name + tier + site across all clusters. The owner is identified by `{cluster, namespace, name}`, where `cluster` is the UID of the `kube-system` namespace (the controller needs `get` on namespaces). Every new deployment carries it in the payload as `owner`.
+
+- The first registration wins. If two new Environments race, the one whose earliest deployment has the lower ID owns the site.
+- A second Environment for the same deployment name, tier and site is a **duplicate**: it posts nothing to GitHub (no deployments, statuses or deregistration markers), its gate is closed (`allowedVersions: []`, so the Rollout cannot deploy), `status.wave` carries site and wave but no role, a Warning event is emitted, and `WaveReady` is `False` with reason `DuplicateSite`, naming the owner: `site <site> of <tier> for <name> is owned by cluster <uid> namespace <ns> name <name>`.
+- Deleting a duplicate has no effect on the owner; it just drops its finalizer.
+- The same object (same cluster, namespace and name) re-reconciling, or deleted and recreated, is still the owner.
+- Deregistration frees the slot: after the owner deregisters (deleted, or site changed), another Environment may register the site.
+- Deployments without an `owner` (legacy, or written by earlier builds) belong to nobody. They never cause a conflict and are adopted by whichever Environment reconciles them.
+
+### Deletion
+
+Every Environment carries the finalizer `environments.kuberik.com/deregister`. On delete the controller posts an `inactive` status `Deregistered: site <site> removed` (always with `auto_inactive: false`) on the site's newest deployment and removes the finalizer. A deregistered site no longer counts for membership, leadership or completion; its past selection records still do. GitHub's automatic `inactive` statuses (no description) appended after the marker do not undo it; any other newer status (the site deploys again) re-registers it.
+
+The identity written to GitHub (deployment name, environment, site) is recorded in `status.wave` before the first GitHub write. Changing `spec.site`, `spec.environment` or `spec.name` deregisters the old identity first, then records the new one. Removing `spec.site` moves the Environment to the default site (the controller's, else `default`): the old site is deregistered and the new one registered. Re-registering the same site simply posts fresh statuses. A deregistration frees the site for another owner (see below).
+
+Before deleting or moving every site of an environment, pin the downstream environments' Rollouts (`spec.wantedVersion`) until the upstream is back. A tier with no registered sites is skipped, so otherwise the downstream takes its versions from the next earlier tier, or becomes unrestricted if there is none.
+
+Deleting an Environment removes the site from its wave. Its RolloutGate is owned by the Environment and is garbage-collected with it, which leaves the Rollout **ungated**: it deploys freely and may pick up any new release candidate. Pin the Rollout (`spec.wantedVersion`) or delete the Rollout first if that is not what you want.
+
+Wave and lockstep changes reach the other sites only with this site's next deployment, because both are read from the newest deployment's payload.
+
+Bypass when GitHub is unreachable or the cluster is dying:
+
+```bash
+kubectl annotate environment X environments.kuberik.com/skip-deregister=true
+```
+
+To replace an owner that can no longer deregister (rebuilt cluster, skip-deregister used), annotate the new Environment `environments.kuberik.com/take-over-site=true`: it posts a deregistration marker on each conflicting owner and registers as the owner. Remove the annotation afterwards; while it is set, any later conflict is resolved by another takeover.
+
+Legacy deployments carry no owner, so an upgraded Environment has no ownership claim until it creates its first new deployment (its next rollout). A second Environment for the same name, tier and site that appears in that window is not blocked: it adopts the legacy history and claims the site, and the original becomes `DuplicateSite`. Do not register duplicates during the upgrade; `take-over-site` repairs it.
+
+The controller also gives up (event plus finalizer removal) when the namespace is terminating and the token Secret is gone. If the controller itself is down:
+
+```bash
+kubectl patch environment X --type=merge -p '{"metadata":{"finalizers":null}}'
+```
+
+Both bypasses, and a cluster that simply died, leave the site registered in GitHub. A registered site that never bakes keeps blocking the next wave and lockstep until someone posts the deregistration marker for it. The CLI for that is a follow-up; until then post the `inactive` status by hand on that site's newest deployment.
+
+### GitHub call budget
+
+Counted from the code, per reconcile (H = entries in the Rollout history, N = other Environments of the same name in the namespace):
+
+| | Calls |
+| --- | --- |
+| History sync of this Environment | per history entry: 1 list deployments (by ref) + 1 list statuses; plus 1 create deployment and 1 create status per missing or changed entry |
+| Environment graph (`status.environmentInfos`) | 1 list deployments of the task, then per relevant environment the paginated deployments list and one status list per displayed deployment; each of the N other Environments repeats the history sync |
+| Wave reading | for self and the upstream: up to 10 list pages (100 each), plus one status list per deployment in the newest 20 of every site; status lists are shared with the graph through a per-reconcile cache, so no deployment's statuses are fetched twice |
+| Site change or deletion | up to 10 list pages, 1 status list, 1 create status; plus the ownership check (shares the cached lists) |
+
+Follow-up: the 20-deep status window per site (`deploymentsPerSite`) is not restructured yet. Status lists of the history sync go through the per-reconcile cache, and the controller runs `--max-concurrent-reconciles` (default 4) reconciles in parallel.
+
+Large fleets multiply the status lists by the number of sites. The budget relies on the `ghcache` conditional requests (ETag): a `304 Not Modified` answer does not count against the GitHub rate limit, so an idle fleet is cheap. For large fleets raise `spec.requeueInterval` (for example `5m`) so the steady-state polling stays well under the limit.
+
+### Follow-ups
+
+- CLI to deregister dead clusters.
+- Helm chart wiring of `SITE` / the `kuberik-cluster-info` ConfigMap.
+- Dashboard UI for sites, waves and the conditions above.
+
+See `config/samples/environment-sites-and-waves.yaml` for a three-site example.
 
 ## GitHub Token Secret
 
@@ -116,47 +274,20 @@ data:
 
 7. **RolloutGate Management**: The controller automatically creates and manages RolloutGate resources for the Environment.
 
-8. **Relationship Resolution**: If relationships are specified, the controller checks deployment statuses across environments to determine allowed versions.
+8. **Tier and Wave Resolution**: The controller reads deployments and statuses from GitHub to determine the upstream tier, the site's wave and the allowed versions.
 
-## Environment Relationships
+## Upgrading to sites and waves
 
-An Environment with a `relationship` gets a RolloutGate whose `allowedVersions` list comes from the related environment's deployment history, as reported through GitHub deployment statuses. The relationship type decides which of those versions pass:
+`spec.relationship` (`After`, `Alongside`, `Parallel`) is gone as a feature: environment order is fixed by tier, and a site always has a wave. To upgrade:
 
-| Type | A version passes the gate once the related environment's deployment of it is | Use it for |
-|------|------------------------------------------------------------------------------|------------|
-| `After` | `Succeeded` | Promotion: deploy only what has been deployed and baked successfully before, e.g. `production` after `staging`. |
-| `Alongside` | `Deploying`, `InProgress` or `Succeeded` (not `Failed` or `Cancelled`) | Following: deploy the same version as another environment at the same time, e.g. a second production region that should inherit `production`'s manual approvals instead of needing its own. |
+1. Apply the new CRD, then the new controller, in every cluster that reports to the same GitHub repository.
+2. Rename non-standard `spec.environment` values to one of the nine accepted names (`dev`, `development`, `test`, `qa`, `staging`, `stage`, `preprod`, `prod`, `production`). Objects outside that set fail validation on their next update; they keep running until then, but their gate is **closed** (`allowedVersions: []`, `WaveReady=False`, reason `UnknownTier`, the message names the value and the accepted names) because an unknown tier has no place in the order. The controller still adds and removes its finalizer with a patch, so such an object can be deleted. Renaming `spec.environment` changes the GitHub environment name (`kuberik/<name>/<environment>`): the controller deregisters the old identity (inactive marker on the old environment's newest deployment) and posts new deployments under the new name, so the Environment's own GitHub history and the dashboard graph for that environment start fresh. The old deployments stay in GitHub and still count for tier membership while they are not deregistered. Rename during a quiet period.
+2a. **Mandatory if you chained aliases.** If you used two names of one tier as a chain (`staging` -> `preprod` -> `prod`, or `test` -> `qa`), the controller no longer merges them: both are the same tier and every Environment that sees both live names is blocked with `InvalidTopology`. Collapse them to one tier name and use `spec.site` / `spec.wave` to split the former stages. Deregister (delete) the Environments of the name you drop.
+3. Optionally set `spec.site` and `spec.wave` (or provide the site once per cluster through the `site` key of the `kuberik-cluster-info` ConfigMap).
+4. Remove `spec.relationship` at your leisure. It is accepted and ignored (condition `Deprecated=True`, reason `RelationshipIgnored`) and will be removed in a later release.
+5. GitHub history continues: deployments without a site count as site `default`, wave 1. Keep the effective site `default` for the first reconcile after the upgrade (do not set the ConfigMap `site` before upgrading). Setting a site afterwards deregisters `default`, and the Environment continues under its new site.
 
-```yaml
-# prod-eu-1 deploys whatever prod deploys, as soon as prod starts deploying it
-spec:
-  environment: "prod-eu-1"
-  relationship:
-    type: "Alongside"
-    environment: "prod"
-```
-
-The gate is an allow list that the Rollout only consults when it picks its next version. For `Alongside` this means:
-
-- **Failures on the related environment**: when the related environment's deployment of a version fails or is cancelled, the version drops out of the allow list. If this environment has already started deploying it, that deployment keeps going and is judged by this environment's own bake and health checks.
-- **Rollbacks don't propagate**: a Rollout only moves to release candidates newer than the version it runs, so when the related environment rolls back, this environment stays where it is.
-
-### Mixed controller versions
-
-Every controller that reports the same deployment `name` to the same GitHub repository reads the other environments' relationships from the GitHub deployment payloads and copies them into its own Environment's status:
-
-- A relationship type the controller doesn't know, for example `Parallel` written by an older controller, is treated as `After`. It is never written to status as-is.
-- Older controllers (v0.1.x) don't know `Alongside`, and their CRD rejects it in status. Upgrade the controller and CRD in every cluster that reports to the repository before you set any Environment to `Alongside`. Until then, those older controllers fail to update their status and RolloutGates.
-
-### Upgrading from `Parallel`
-
-`Parallel` has been removed. It never gated differently from `After`: both only passed versions whose deployment on the related environment succeeded. With the new CRD, an Environment that still has `type: Parallel` fails validation on its next update. Until it is updated, the controller treats a stored `Parallel` as `After`.
-
-To upgrade without disruption:
-
-1. Change every `type: Parallel` to `type: After`. Both the old and the new CRD accept it, and it gates exactly as before.
-2. Upgrade the controller and CRD in every cluster that reports to the same GitHub repository.
-3. Set `type: Alongside` on the environments that should follow another one.
+What changes after the upgrade: every Environment gets the `environments.kuberik.com/deregister` finalizer and `status.wave`, and new deployment payloads carry `site`, `wave` and `owner`.
 
 ## Installation
 
@@ -216,9 +347,12 @@ make run
 type EnvironmentSpec struct {
     RolloutRef       corev1.LocalObjectReference `json:"rolloutRef"`
     Name             string                      `json:"name"`
-    Environment      string                      `json:"environment,omitempty"`
+    Environment      string                      `json:"environment"` // dev|development|test|qa|staging|stage|preprod|prod|production
     Ref              string                      `json:"ref,omitempty"`
-    Relationship     *EnvironmentRelationship    `json:"relationship,omitempty"`
+    Relationship     *EnvironmentRelationship    `json:"relationship,omitempty"` // deprecated, ignored
+    Site             string                      `json:"site,omitempty"`
+    Wave             *int32                      `json:"wave,omitempty"`
+    Lockstep         bool                        `json:"lockstep,omitempty"`
     Backend          BackendConfig               `json:"backend"`
     RequeueInterval  string                      `json:"requeueInterval,omitempty"`
 }
@@ -230,12 +364,13 @@ type BackendConfig struct {
 }
 ```
 
-### EnvironmentRelationship
+### EnvironmentRelationship (deprecated)
 
 ```go
+// Accepted and ignored; removed in a later release.
 type EnvironmentRelationship struct {
     Environment string           `json:"environment"`
-    Type        RelationshipType `json:"type"` // "After" or "Alongside"
+    Type        RelationshipType `json:"type"` // "After", "Alongside" or "Parallel"
 }
 ```
 

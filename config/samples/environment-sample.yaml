@@ -10,15 +10,13 @@ spec:
 
   # Deployment configuration
   name: "kuberik-myapp-production"
-  environment: "production"
+  environment: "prod"
   ref: "main"
 
-  # Relationship configuration
-  relationship:
-    type: "after"
-    environments:
-      - "staging"
-      - "testing"
+  # Site and wave of this instance (both optional: the site defaults to the
+  # controller's default site, then "default"; the wave defaults to 1)
+  site: "eu-west-1"
+  wave: 1
 
   # Backend-specific configuration
   backend:

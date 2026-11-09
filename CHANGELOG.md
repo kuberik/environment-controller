@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [Unreleased]
+
+### Added
+
+- Sites and waves: `spec.site`, `spec.wave`, `spec.lockstep`, `status.wave`, leader/follower selection and the `WaveReady` and `LockstepConsistent` conditions; default site from `--default-site` / `$SITE`, then `default`
+
+- Fixed tier ordering for `spec.environment` (dev, test, staging, prod, with aliases); an environment is gated on the last wave of the nearest earlier tier present in GitHub
+
+- One owner per deployment name, tier and site across clusters: duplicates report `WaveReady=False` with reason `DuplicateSite` and post nothing
+
+- Followers drop the leader's version when the leader's bake failed or was cancelled
+
+### Changed
+
+- **Breaking:** `spec.environment` is restricted to `dev`, `development`, `test`, `qa`, `staging`, `stage`, `preprod`, `prod`, `production`; other values fail validation on the next update
+
+- Every Environment is sited, carries the `environments.kuberik.com/deregister` finalizer and gets `status.wave`; deployment payloads carry `site`, `wave` and `owner`. Legacy deployments without a site count as site `default`, wave 1
+
+### Deprecated
+
+- `spec.relationship` is accepted and ignored (condition `Deprecated=True`, reason `RelationshipIgnored`) and will be removed in a later release; the `Alongside` and `After` behaviours are gone
+
 ## [0.1.0] - 2026-01-07
 
 ### Added

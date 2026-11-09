@@ -22,10 +22,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v62/github"
@@ -34,23 +36,29 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	k8sptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllerruntimectrl "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
+	"github.com/kuberik/environment-controller/internal/wave"
 	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 )
 
 const (
 	// backendTypeGitHub is the Environment backend type handled by this controller
 	backendTypeGitHub = "github"
+
+	// defaultSecretName is the GitHub token Secret used when Backend.Secret is unset.
+	defaultSecretName = "github-token"
 	// productionEnvironment is the environment that is reported to GitHub as a production environment
-	productionEnvironment = "production"
+	productionEnvironment = "prod"
 	// rolloutDashboardServiceName is the name of the rollout-dashboard service in the controller's namespace
 	rolloutDashboardServiceName = "rollout-dashboard"
 
@@ -79,15 +87,31 @@ const (
 // deploymentPayload represents the payload stored in GitHub deployments
 // Only immutable data should be stored here since GitHub deployments cannot be updated
 type deploymentPayload struct {
-	ID           string                                   `json:"id"`                     // History entry ID (immutable)
-	Relationship *kuberikv1alpha1.EnvironmentRelationship `json:"relationship,omitempty"` // Relationship for this environment
-	Version      *kuberikrolloutv1alpha1.VersionInfo      `json:"version,omitempty"`      // Version information (immutable)
+	ID      string                              `json:"id"`                // History entry ID (immutable)
+	Version *kuberikrolloutv1alpha1.VersionInfo `json:"version,omitempty"` // Version information (immutable)
+
+	// Sites and waves. Every new deployment carries them; deployments written
+	// before sites existed have none and are read as site "default", wave 1
+	// (see extractDeploymentPayload).
+	Site      string `json:"site,omitempty"`      // Effective site that created the deployment
+	Wave      int32  `json:"wave,omitempty"`      // Effective wave of the site at creation
+	Lockstep  bool   `json:"lockstep,omitempty"`  // Lockstep flag of the site at creation
+	Selection bool   `json:"selection,omitempty"` // Written by the wave leader (selection record)
+
+	// Owner is the Environment that created the deployment (see ownership.go).
+	// Absent on deployments written before ownership existed.
+	Owner *deploymentOwner `json:"owner,omitempty"`
 }
 
 // deploymentKey represents a unique key for mapping deployments by ID and environment
 type deploymentKey struct {
 	ID          string
 	Environment string
+	// Site is the payload site; Rollout history IDs are per-cluster sequences,
+	// so two sites collide on ID.
+	Site string
+	// Owner is the payload owner, the zero value when none was recorded.
+	Owner deploymentOwner
 }
 
 // GitHubEnvironmentReconciler reconciles an Environment object for GitHub backend
@@ -95,6 +119,30 @@ type GitHubEnvironmentReconciler struct {
 	client.Client
 	Scheme         *runtime.Scheme
 	CacheTransport http.RoundTripper
+
+	// DefaultSite is the site used by Environments that do not set spec.site
+	// (cmd/main.go fills it from --default-site / $SITE). Empty means
+	// DefaultSiteName.
+	DefaultSite string
+
+	// ClusterID identifies this cluster in deployment ownership. Empty means the
+	// UID of namespace kube-system, read on first use (tests may set it).
+	ClusterID string
+	clusterMu sync.Mutex
+	// APIReader reads the cluster identity uncached (the manager cache has no
+	// Namespace informer). Nil falls back to Client (tests).
+	APIReader client.Reader
+
+	// MaxConcurrentReconciles is the number of parallel reconciles (cmd/main.go
+	// --max-concurrent-reconciles). Values below 1 mean 1.
+	MaxConcurrentReconciles int
+
+	// GitHubBaseURL overrides the GitHub API base URL (tests point it at a fake
+	// server). Empty means api.github.com.
+	GitHubBaseURL string
+
+	// Recorder emits events (optional; nil disables events).
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=environments.kuberik.com,resources=environments,verbs=get;list;watch;create;update;patch;delete
@@ -107,6 +155,8 @@ type GitHubEnvironmentReconciler struct {
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -123,9 +173,27 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Deletion: post the deregistration marker, then release the finalizer.
+	if !deployment.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, deployment)
+	}
+
+	// One status fetch per GitHub deployment per reconcile (see readMembers).
+	ctx = withReconcileCache(ctx)
+
+	// Every Environment carries the deregistration finalizer.
+	if err := r.addFinalizer(ctx, deployment); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Validate backend
 	if deployment.Spec.Backend.Type != backendTypeGitHub {
 		return ctrl.Result{}, fmt.Errorf("unsupported backend: %s", deployment.Spec.Backend.Type)
+	}
+
+	// Report deprecations first so a missing Rollout/Secret does not hide them.
+	if err := r.reconcileDeprecations(ctx, deployment); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Get the referenced Rollout to get the current version
@@ -142,16 +210,55 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
+	// Site changes (deregister the old site, record the new identity)
+	if err := r.reconcileSiteChange(ctx, githubClient, deployment); err != nil {
+		logger.Error(err, "Failed to reconcile site change")
+		return ctrl.Result{}, err
+	}
+
+	// One Environment owns a deployment name + tier + site. A second one posts
+	// nothing to GitHub and keeps its gate closed.
+	owner, repo, err := parseProject(deployment.Spec.Backend.Project)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	self, err := r.selfOwner(ctx, deployment)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	conflict, err := r.findSiteConflict(ctx, githubClient, owner, repo, ensureKuberikPrefix(deployment.Spec.Name), deployment.Spec.Environment, r.effectiveSite(deployment), self)
+	if err != nil {
+		logger.Error(err, "Failed to check site ownership")
+		return ctrl.Result{}, err
+	}
+	if conflict != nil && deployment.Annotations[SiteTakeOverAnnotation] == annotationTrue {
+		if err := r.takeOverSite(ctx, githubClient, deployment, self); err != nil {
+			logger.Error(err, "Failed to take over site")
+			return ctrl.Result{}, err
+		}
+		conflict, err = r.findSiteConflict(ctx, githubClient, owner, repo, ensureKuberikPrefix(deployment.Spec.Name), deployment.Spec.Environment, r.effectiveSite(deployment), self)
+		if err != nil {
+			logger.Error(err, "Failed to check site ownership")
+			return ctrl.Result{}, err
+		}
+	}
+	if conflict != nil {
+		if err := r.reconcileDuplicateSite(ctx, deployment, *conflict); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.requeueResult(ctx, deployment), nil
+	}
+
 	// Sync entire rollout history with GitHub deployments and statuses
 	if err := r.syncDeploymentHistory(ctx, githubClient, deployment, rollout); err != nil {
 		logger.Error(err, "Failed to sync deployment history")
 		return ctrl.Result{}, err
 	}
 
-	// Build relationship graph
-	graphData, err := r.buildRelationshipGraph(ctx, deployment, githubClient)
+	// Build the environment graph
+	graphData, err := r.buildEnvironmentGraph(ctx, deployment, githubClient)
 	if err != nil {
-		logger.Error(err, "Failed to build relationship graph")
+		logger.Error(err, "Failed to build environment graph")
 		return ctrl.Result{}, err
 	}
 
@@ -167,13 +274,20 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
-	// Update allowed versions on RolloutGate based on relationships
-	if err := r.updateAllowedVersionsFromRelationships(ctx, deployment); err != nil {
-		logger.Error(err, "Failed to update allowed versions from relationships")
+	// Update allowed versions on RolloutGate with wave.Decide (status.wave and
+	// conditions are written before the gate).
+	if err := r.reconcileWave(ctx, githubClient, deployment, rollout); err != nil {
+		logger.Error(err, "Failed to reconcile wave")
 		return ctrl.Result{}, err
 	}
 
-	// Requeue at configured interval (default 1 minute) to keep status updated
+	return r.requeueResult(ctx, deployment), nil
+}
+
+// requeueResult requeues at the configured interval (default 1 minute) to keep
+// status updated.
+func (r *GitHubEnvironmentReconciler) requeueResult(ctx context.Context, deployment *kuberikv1alpha1.Environment) ctrl.Result {
+	logger := log.FromContext(ctx)
 	requeueInterval := time.Minute // default
 	if deployment.Spec.RequeueInterval != "" {
 		parsed, err := time.ParseDuration(deployment.Spec.RequeueInterval)
@@ -183,7 +297,12 @@ func (r *GitHubEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			requeueInterval = parsed
 		}
 	}
-	return ctrl.Result{RequeueAfter: requeueInterval}, nil
+	return ctrl.Result{RequeueAfter: requeueInterval}
+}
+
+// controllerOptions returns the controller options derived from the reconciler.
+func (r *GitHubEnvironmentReconciler) controllerOptions() controllerruntimectrl.Options {
+	return controllerruntimectrl.Options{MaxConcurrentReconciles: max(r.MaxConcurrentReconciles, 1)}
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -195,6 +314,7 @@ func (r *GitHubEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.rolloutToEnvironment),
 		).
 		Named("environment").
+		WithOptions(r.controllerOptions()).
 		Complete(r)
 }
 
@@ -247,7 +367,7 @@ func (r *GitHubEnvironmentReconciler) getReferencedRollout(ctx context.Context, 
 func (r *GitHubEnvironmentReconciler) getGitHubClient(ctx context.Context, deployment *kuberikv1alpha1.Environment) (*github.Client, error) {
 	secretName := deployment.Spec.Backend.Secret
 	if secretName == "" {
-		secretName = "github-token" // Default secret name
+		secretName = defaultSecretName
 	}
 
 	secret := &corev1.Secret{}
@@ -276,7 +396,15 @@ func (r *GitHubEnvironmentReconciler) getGitHubClient(ctx context.Context, deplo
 	}
 
 	// Create GitHub client with OAuth2 authentication and caching
-	return github.NewClient(httpClient).WithAuthToken(string(token)), nil
+	gh := github.NewClient(httpClient).WithAuthToken(string(token))
+	if r.GitHubBaseURL != "" {
+		u, err := url.Parse(strings.TrimSuffix(r.GitHubBaseURL, "/") + "/")
+		if err != nil {
+			return nil, fmt.Errorf("invalid GitHub base URL %q: %w", r.GitHubBaseURL, err)
+		}
+		gh.BaseURL = u
+	}
+	return gh, nil
 }
 
 // createDeploymentStatus creates a GitHub deployment status for the given environment
@@ -304,6 +432,14 @@ func (r *GitHubEnvironmentReconciler) createDeploymentStatus(ctx context.Context
 	if environmentURL != "" {
 		statusRequest.EnvironmentURL = github.String(environmentURL)
 	}
+
+	// Deployments share one GitHub environment across sites. With GitHub's
+	// default auto_inactive a success on one site would mark every other site's
+	// deployment inactive, so it is switched off.
+	statusRequest.AutoInactive = github.Bool(false)
+
+	// The cached statuses of this deployment are stale from here on.
+	reconcileCacheFrom(ctx).invalidate(deploymentID)
 
 	// Create the deployment status
 	_, _, createErr := ghClient.Repositories.CreateDeploymentStatus(ctx, owner, repo, deploymentID, statusRequest)
@@ -333,11 +469,11 @@ func (r *GitHubEnvironmentReconciler) getCurrentVersionFromRollout(rollout *kube
 }
 
 // updateStatus updates the Environment status with all gathered information
-func (r *GitHubEnvironmentReconciler) updateStatus(ctx context.Context, environment *kuberikv1alpha1.Environment, graphData *relationshipGraphData) error {
+func (r *GitHubEnvironmentReconciler) updateStatus(ctx context.Context, environment *kuberikv1alpha1.Environment, graphData *environmentGraphData) error {
 	newStatus := environment.Status.DeepCopy()
 
 	// Update current version - get from graphData history for current environment
-	currentEnv := environment.Spec.Environment
+	currentEnv, _ := wave.Canonical(environment.Spec.Environment)
 	if history, ok := graphData.envHistory[currentEnv]; ok && len(history) > 0 {
 		// History is already sorted descending
 		if history[0].Version.Revision != nil {
@@ -375,17 +511,15 @@ func (r *GitHubEnvironmentReconciler) updateStatus(ctx context.Context, environm
 }
 
 // buildEnvironmentInfos builds the list of environment infos from graph data
-func (r *GitHubEnvironmentReconciler) buildEnvironmentInfos(environment *kuberikv1alpha1.Environment, graphData *relationshipGraphData) []kuberikv1alpha1.EnvironmentInfo {
+func (r *GitHubEnvironmentReconciler) buildEnvironmentInfos(environment *kuberikv1alpha1.Environment, graphData *environmentGraphData) []kuberikv1alpha1.EnvironmentInfo {
 	if environment.Status.EnvironmentInfos == nil {
 		environment.Status.EnvironmentInfos = []kuberikv1alpha1.EnvironmentInfo{}
 	}
 
-	// Make a deep copy of the environment infos. Relationships are normalized because status
-	// written by an older controller may still hold a type the CRD no longer accepts.
+	// Make a deep copy of the environment infos.
 	environmentInfoList := make([]kuberikv1alpha1.EnvironmentInfo, len(environment.Status.EnvironmentInfos))
 	for i := range environment.Status.EnvironmentInfos {
 		environmentInfoList[i] = *environment.Status.EnvironmentInfos[i].DeepCopy()
-		environmentInfoList[i].Relationship = normalizeRelationship(environmentInfoList[i].Relationship)
 	}
 
 	// Update or add environment infos with history from graphData
@@ -400,33 +534,16 @@ func (r *GitHubEnvironmentReconciler) buildEnvironmentInfos(environment *kuberik
 			}
 		}
 
-		// Check if environment is directly connected to current environment
-		// - It is the current environment
-		// - Current environment depends on it
-		// - It depends on current environment
-		isDirectlyConnected := false
-		currentEnv := environment.Spec.Environment
-
-		if envName == currentEnv {
-			isDirectlyConnected = true
-		} else {
-			// Check if current environment depends on this env
-			if environment.Spec.Relationship != nil && environment.Spec.Relationship.Environment == envName {
-				isDirectlyConnected = true
-			}
-			// Check if this env depends on current environment
-			if info.Relationship != nil && info.Relationship.Environment == currentEnv {
-				isDirectlyConnected = true
-			}
-		}
+		// Directly connected: the current tier and its neighbours among the tiers present.
+		isDirectlyConnected := directlyConnected(environment.Spec.Environment, envName, graphData.environmentInfos)
 
 		// If not directly connected, keep only the latest deployment history
 		if !isDirectlyConnected && len(history) > 1 {
-			// History is already sorted descending by ID/Revision in buildRelationshipGraph
+			// History is already sorted descending by ID/Revision in buildEnvironmentGraph
 			history = []kuberikrolloutv1alpha1.DeploymentHistoryEntry{history[0]}
 		}
 
-		environmentInfoList = updateEnvironmentInfoWithHistory(environmentInfoList, envName, info.EnvironmentURL, info.Relationship, history)
+		environmentInfoList = updateEnvironmentInfoWithHistory(environmentInfoList, envName, info.EnvironmentURL, history)
 	}
 
 	// Preserve existing environmentInfos... (same logic as before)
@@ -434,50 +551,24 @@ func (r *GitHubEnvironmentReconciler) buildEnvironmentInfos(environment *kuberik
 	// and updateEnvironmentInfoWithHistory updates in place or appends.
 
 	// Sort (same logic as before)
-	// Pre-calculate max IDs and parent map
+	// Tiers sort earliest first; unknown names after them, by latest history ID then name.
 	maxIDMap := make(map[string]int64)
-	parentMap := make(map[string]string)
 	for _, info := range environmentInfoList {
 		maxIDMap[info.Environment] = getMaxHistoryID(info.History)
-		if info.Relationship != nil && info.Relationship.Environment != "" {
-			parentMap[info.Environment] = info.Relationship.Environment
-		}
 	}
-
-	// Recursive helper to check if envA is an ancestor of envB
-	var isAncestor func(envA, envB string) bool
-	isAncestor = func(envA, envB string) bool {
-		parent, exists := parentMap[envB]
-		if !exists {
-			return false
-		}
-		if parent == envA {
-			return true
-		}
-		return isAncestor(envA, parent)
-	}
-
 	sort.SliceStable(environmentInfoList, func(i, j int) bool {
 		envI := environmentInfoList[i].Environment
 		envJ := environmentInfoList[j].Environment
-
-		// If envI is an ancestor of envJ, envI comes first
-		if isAncestor(envI, envJ) {
-			return true
+		rI, rJ := wave.Rank(envI), wave.Rank(envJ)
+		if (rI >= 0) != (rJ >= 0) {
+			return rI >= 0
 		}
-		// If envJ is an ancestor of envI, envJ comes first
-		if isAncestor(envJ, envI) {
-			return false
+		if rI != rJ {
+			return rI < rJ
 		}
-
-		// Tie-breaker: higher max history ID first
-		idI := maxIDMap[envI]
-		idJ := maxIDMap[envJ]
-		if idI != idJ {
-			return idI > idJ
+		if maxIDMap[envI] != maxIDMap[envJ] {
+			return maxIDMap[envI] > maxIDMap[envJ]
 		}
-
-		// Last tie-breaker: environment name for stable sort
 		return envI < envJ
 	})
 
@@ -778,30 +869,14 @@ func (r *GitHubEnvironmentReconciler) extractDeploymentPayload(dep *github.Deplo
 	if payload.ID == "" || payload.Version == nil {
 		return nil
 	}
-	// Payloads can be written by other clusters' controllers, possibly older ones that still use
-	// relationship types this version doesn't know (e.g. the removed "Parallel").
-	payload.Relationship = normalizeRelationship(payload.Relationship)
-
+	// Deployments written before sites existed continue as site "default", wave 1.
+	if payload.Site == "" {
+		payload.Site = DefaultSiteName
+	}
+	if payload.Wave == 0 {
+		payload.Wave = 1
+	}
 	return &payload
-}
-
-// normalizeRelationship returns a copy of rel whose type is one this controller knows.
-// Relationships are read from places the CRD's enum doesn't guard: GitHub deployment payloads
-// written by other (possibly older) controllers, Environments stored before a CRD upgrade, and
-// status written by an older controller. Any other type, such as the removed "Parallel", is
-// treated as "After". That matches how older controllers gated such environments, and it keeps
-// the value valid for this controller's status, which the CRD's enum would otherwise reject.
-func normalizeRelationship(rel *kuberikv1alpha1.EnvironmentRelationship) *kuberikv1alpha1.EnvironmentRelationship {
-	if rel == nil {
-		return nil
-	}
-	normalized := rel.DeepCopy()
-	switch normalized.Type {
-	case kuberikv1alpha1.RelationshipTypeAfter, kuberikv1alpha1.RelationshipTypeAlongside:
-	default:
-		normalized.Type = kuberikv1alpha1.RelationshipTypeAfter
-	}
-	return normalized
 }
 
 // extractDeploymentKey extracts the deployment key from a GitHub deployment's payload and environment
@@ -816,10 +891,15 @@ func (r *GitHubEnvironmentReconciler) extractDeploymentKey(dep *github.Deploymen
 	}
 
 	// Get ID from payload
-	return &deploymentKey{
+	key := &deploymentKey{
 		ID:          payload.ID,
 		Environment: *dep.Environment,
+		Site:        payload.Site,
 	}
+	if payload.Owner != nil {
+		key.Owner = *payload.Owner
+	}
+	return key
 }
 
 // syncDeploymentHistory ensures a GitHub deployment exists for each rollout history entry
@@ -835,6 +915,11 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 	deploymentName := ensureKuberikPrefix(environment.Spec.Name)
 	formattedEnv := formatDeploymentEnvironment(deploymentName, environment.Spec.Environment)
 	task := formatDeploymentTask(deploymentName)
+	site := r.effectiveSite(environment)
+	self, err := r.selfOwner(ctx, environment)
+	if err != nil {
+		return err
+	}
 
 	// Map deployments by ID + environment from payload
 	// We'll query deployments per history entry using ref + environment for more targeted queries
@@ -858,6 +943,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 		key := deploymentKey{
 			ID:          historyID,
 			Environment: formattedEnv,
+			Site:        site,
 		}
 
 		// Check if we already found this deployment in a previous iteration
@@ -881,21 +967,26 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 					continue
 				}
 
-				// Try to extract key from list response first (faster)
+				// Try to extract key from list response first (faster). A readable
+				// payload decides the match; a non-matching one is never refetched.
 				existingKey := r.extractDeploymentKey(d)
-				if existingKey != nil && existingKey.ID == historyID {
-					dep = d
-					keyToDeployment[key] = dep
-					break
+				if existingKey != nil {
+					if existingKey.ID == historyID && existingKey.Site == site && ownerMatches(existingKey.Owner, self) {
+						dep = d
+						keyToDeployment[key] = dep
+						break
+					}
+					continue
 				}
 
-				// If payload extraction failed, fetch individually to get full payload
+				// Only when the list item's payload is unreadable, fetch it
+				// individually to get the full payload.
 				fullDeployment, _, err := gh.Repositories.GetDeployment(ctx, owner, repo, *d.ID)
 				if err != nil {
 					continue
 				}
 				existingKey = r.extractDeploymentKey(fullDeployment)
-				if existingKey != nil && existingKey.ID == historyID {
+				if existingKey != nil && existingKey.ID == historyID && existingKey.Site == site && ownerMatches(existingKey.Owner, self) {
 					dep = fullDeployment
 					keyToDeployment[key] = dep
 					break
@@ -905,13 +996,14 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 
 		if dep == nil {
 			// Create missing deployment for this history entry
-			// Only store immutable data in payload: ID, relationship, and version
+			// Only store immutable data in payload: ID, site, wave and version
 			// Status and other mutable fields come from GitHub deployment statuses
 			payload := deploymentPayload{
-				ID:           historyID,
-				Relationship: normalizeRelationship(environment.Spec.Relationship),
-				Version:      h.Version.DeepCopy(),
+				ID:      historyID,
+				Version: h.Version.DeepCopy(),
 			}
+			r.stampPayload(&payload, environment, site, self)
+
 			payloadJSON, err := json.Marshal(payload)
 			if err != nil {
 				return fmt.Errorf("failed to marshal deployment payload: %w", err)
@@ -922,7 +1014,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 				Task:                  &task,
 				Environment:           &formattedEnv,
 				Description:           h.Message,
-				ProductionEnvironment: github.Bool(environment.Spec.Environment == productionEnvironment),
+				ProductionEnvironment: github.Bool(canonicalEnv(environment.Spec.Environment) == productionEnvironment),
 				AutoMerge:             github.Bool(false),
 				Payload:               payloadJSON,
 				RequiredContexts:      k8sptr.To([]string{}),
@@ -931,6 +1023,7 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 			if err != nil {
 				return fmt.Errorf("failed to create GitHub deployment: %w", err)
 			}
+			reconcileCacheFrom(ctx).invalidateList(listCacheKey(task, formattedEnv))
 			dep = created
 			keyToDeployment[key] = dep
 		}
@@ -953,19 +1046,8 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 
 		// Check all statuses to see if we've already created this exact status
 		// This prevents duplicate statuses like: pending -> success -> pending
-		statuses, _, err := gh.Repositories.ListDeploymentStatuses(ctx, owner, repo, dep.GetID(), &github.ListOptions{})
-		statusExists := false
-		if err == nil && len(statuses) > 0 {
-			// Statuses are ordered newest first, so the first one is the latest
-			for _, status := range statuses {
-				if status.State != nil && *status.State == ghState && status.Description != nil && *status.Description == ghDesc {
-					// This exact status already exists, skip creating it again
-					statusExists = true
-					break
-				}
-			}
-		}
-
+		statuses, err := r.fetchAllDeploymentStatuses(ctx, gh, owner, repo, dep.GetID())
+		statusExists := err == nil && statusAlreadyPosted(statuses, ghState, ghDesc)
 		if !statusExists {
 			if err := r.createDeploymentStatus(ctx, gh, environment, dep.GetID(), ghState, ghDesc); err != nil {
 				return err
@@ -974,6 +1056,21 @@ func (r *GitHubEnvironmentReconciler) syncDeploymentHistory(ctx context.Context,
 	}
 
 	return nil
+}
+
+// statusAlreadyPosted reports whether the exact state+description exists among the
+// statuses (newest first). A Deregistered marker as the effective newest status means the site
+// is registering again, so the de-dup must not apply.
+func statusAlreadyPosted(statuses []*github.DeploymentStatus, state, desc string) bool {
+	if len(statuses) == 0 || isDeregistered(statuses) {
+		return false
+	}
+	for _, status := range statuses {
+		if status.State != nil && *status.State == state && status.Description != nil && *status.Description == desc {
+			return true
+		}
+	}
+	return false
 }
 
 // mapBakeToGitHubState maps bake status/message to GitHub DeploymentStatus state and description prefix
@@ -1195,6 +1292,10 @@ func (r *GitHubEnvironmentReconciler) processDeploymentForHistory(ctx context.Co
 // fetchAllDeploymentStatuses fetches all deployment statuses with pagination
 // entryID and envName are optional parameters used for logging errors
 func (r *GitHubEnvironmentReconciler) fetchAllDeploymentStatuses(ctx context.Context, ghClient *github.Client, owner, repo string, deploymentID int64) ([]*github.DeploymentStatus, error) {
+	cache := reconcileCacheFrom(ctx)
+	if cached, ok := cache.get(deploymentID); ok {
+		return cached, nil
+	}
 	allStatuses := make([]*github.DeploymentStatus, 0)
 	statusOpts := &github.ListOptions{PerPage: 100}
 	for {
@@ -1208,6 +1309,7 @@ func (r *GitHubEnvironmentReconciler) fetchAllDeploymentStatuses(ctx context.Con
 		}
 		statusOpts.Page = resp.NextPage
 	}
+	cache.put(deploymentID, allStatuses)
 	return allStatuses, nil
 }
 
@@ -1215,20 +1317,8 @@ func (r *GitHubEnvironmentReconciler) fetchAllDeploymentStatuses(ctx context.Con
 // This function sets all fields that should be managed by this controller, whether creating or updating.
 func (r *GitHubEnvironmentReconciler) applyRolloutGateDesiredState(rolloutGate *kuberikrolloutv1alpha1.RolloutGate, deployment *kuberikv1alpha1.Environment) error {
 	// Set annotations
-	prettyName := "Relationship not ready yet"
-	var description string
-	if deployment.Spec.Relationship != nil {
-		relatedEnv := deployment.Spec.Relationship.Environment
-		switch deployment.Spec.Relationship.Type {
-		case kuberikv1alpha1.RelationshipTypeAlongside:
-			description = fmt.Sprintf("This gate passes versions as soon as the %s environment starts deploying them, unless the deployment there has failed or been cancelled.", relatedEnv)
-		default:
-			// After, and any type this controller doesn't know (see normalizeRelationship)
-			description = fmt.Sprintf("This gate is passing only for those versions that have been successfully deployed after the %s environment.", relatedEnv)
-		}
-	} else {
-		description = "This gate is passing only for those versions that have been successfully deployed to the related environment."
-	}
+	prettyName := "Previous environment not ready yet"
+	description := "This gate is passing only for those versions that have been successfully deployed to the previous environment tier (dev, test, staging, prod) or the previous wave."
 
 	if rolloutGate.Annotations == nil {
 		rolloutGate.Annotations = make(map[string]string)
@@ -1373,11 +1463,10 @@ func findOwnedRolloutGate(gates []kuberikrolloutv1alpha1.RolloutGate, environmen
 // environmentInfo holds information about an environment's deployment
 type environmentInfo struct {
 	EnvironmentURL string
-	Relationship   *kuberikv1alpha1.EnvironmentRelationship
 }
 
-// relationshipGraphData holds the data needed for relationship-based operations
-type relationshipGraphData struct {
+// environmentGraphData holds the data about every environment tier of one app
+type environmentGraphData struct {
 	relevantEnvironments map[string]bool
 	relevantVersions     map[string]bool
 	envDeployments       map[string][]*github.Deployment
@@ -1388,10 +1477,11 @@ type relationshipGraphData struct {
 	environmentInfos      map[string]environmentInfo
 }
 
-// buildRelationshipGraph discovers all environments and builds the relationship graph
+// buildEnvironmentGraph discovers all environment tiers of the app and reads their history.
+// Environment names are canonical tiers (see wave.Canonical): aliases are one environment.
 //
-//nolint:gocyclo // Core relationship logic, deliberately left unchanged by the lint cleanup; split it up in its own change.
-func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context, environment *kuberikv1alpha1.Environment, ghClient *github.Client) (*relationshipGraphData, error) {
+//nolint:gocyclo // Core graph logic, deliberately left unchanged by the lint cleanup; split it up in its own change.
+func (r *GitHubEnvironmentReconciler) buildEnvironmentGraph(ctx context.Context, environment *kuberikv1alpha1.Environment, ghClient *github.Client) (*environmentGraphData, error) {
 	owner, repo, err := parseProject(environment.Spec.Backend.Project)
 	if err != nil {
 		return nil, err
@@ -1400,14 +1490,10 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 	// Ensure deployment name has kuberik prefix for GitHub
 	deploymentName := ensureKuberikPrefix(environment.Spec.Name)
 
-	// Build relationship graph to determine relevant environments
-	// Relevant environments are: current environment + all environments related to it (directly or transitively)
+	// Relevant environments are every tier of this app, keyed by canonical tier name
 	relevantEnvironments := make(map[string]bool)
-	currentEnv := environment.Spec.Environment
+	currentEnv, _ := wave.Canonical(environment.Spec.Environment)
 	relevantEnvironments[currentEnv] = true
-
-	// Build a map of environment -> relationships from all discovered environments
-	envRelationships := make(map[string]*kuberikv1alpha1.EnvironmentRelationship)
 
 	// Query all deployments with the same task to discover all environments
 	task := formatDeploymentTask(deploymentName)
@@ -1432,14 +1518,8 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 		// The environment format is "deploymentName/environment", so split and take the last part
 		envParts := strings.Split(env, "/")
 		if len(envParts) > 0 {
-			envName := envParts[len(envParts)-1]
+			envName, _ := wave.Canonical(envParts[len(envParts)-1])
 			envDeployments[envName] = append(envDeployments[envName], d)
-
-			// Extract relationship from payload
-			payload := r.extractDeploymentPayload(d)
-			if payload != nil && payload.Relationship != nil {
-				envRelationships[envName] = payload.Relationship
-			}
 		}
 	}
 
@@ -1456,46 +1536,27 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 			if env.Spec.Environment == "" {
 				continue
 			}
-			envName := env.Spec.Environment
+			envName, _ := wave.Canonical(env.Spec.Environment)
 
 			// Add to discovered environments
 			if envDeployments[envName] == nil {
 				envDeployments[envName] = []*github.Deployment{}
 			}
-
-			// Extract relationship from Environment spec
-			if env.Spec.Relationship != nil {
-				envRelationships[envName] = normalizeRelationship(env.Spec.Relationship)
-			}
 		}
 	}
 
-	// Build set of relevant environments based on relationships
-	// Start with current environment and traverse relationships
-	visited := make(map[string]bool)
-	var traverseRelationships func(env string)
-	traverseRelationships = func(env string) {
-		if visited[env] {
-			return
-		}
-		visited[env] = true
-		relevantEnvironments[env] = true
-
-		// Find all environments that have a relationship pointing to this environment
-		for otherEnv, rel := range envRelationships {
-			if rel != nil && rel.Environment == env {
-				traverseRelationships(otherEnv)
-			}
-		}
-
-		// Also traverse environments that this environment relates to
-		if rel, exists := envRelationships[env]; exists && rel != nil {
-			traverseRelationships(rel.Environment)
-		}
+	// Rollout history IDs are per-cluster sequences: never merge sites in the
+	// displayed history. Each environment shows one site (see displayDeployments).
+	ownSites := r.ownSitesByEnv(environment, environmentList)
+	for envName, deps := range envDeployments {
+		envDeployments[envName] = r.displayDeployments(ctx, ghClient, owner, repo, envName, deps, ownSites)
 	}
-	traverseRelationships(currentEnv)
 
-	// Track environment info (environment URL and relationship) for all environments
+	for envName := range envDeployments {
+		relevantEnvironments[envName] = true
+	}
+
+	// Track environment info (environment URL) for all environments
 	environmentInfos := make(map[string]environmentInfo)
 
 	// First, update environment infos from GitHub deployments
@@ -1504,15 +1565,9 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 			continue
 		}
 
-		// Track the latest environment URL and relationship (first deployment in list is latest)
+		// Track the latest environment URL (first deployment in list is latest)
 		latestDeployment := deployments[0]
 		envInfo := environmentInfo{}
-
-		// Extract relationship from the latest deployment's payload
-		payload := r.extractDeploymentPayload(latestDeployment)
-		if payload != nil && payload.Relationship != nil {
-			envInfo.Relationship = payload.Relationship
-		}
 
 		// Extract environment URL from the latest deployment's statuses
 		statuses, err := r.fetchAllDeploymentStatuses(ctx, ghClient, owner, repo, latestDeployment.GetID())
@@ -1533,20 +1588,11 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 		if env.Spec.Name != environment.Spec.Name || env.Spec.Environment == "" {
 			continue
 		}
-		envName := env.Spec.Environment
+		envName, _ := wave.Canonical(env.Spec.Environment)
 
 		// Only add if not already set from GitHub deployments and if it's a relevant environment
-		existingInfo, exists := environmentInfos[envName]
-		if !exists && relevantEnvironments[envName] {
-			envInfo := environmentInfo{}
-			if env.Spec.Relationship != nil {
-				envInfo.Relationship = normalizeRelationship(env.Spec.Relationship)
-			}
-			environmentInfos[envName] = envInfo
-		} else if exists && existingInfo.Relationship == nil && env.Spec.Relationship != nil {
-			// Update relationship from Environment spec if not set from GitHub
-			existingInfo.Relationship = normalizeRelationship(env.Spec.Relationship)
-			environmentInfos[envName] = existingInfo
+		if _, exists := environmentInfos[envName]; !exists && relevantEnvironments[envName] {
+			environmentInfos[envName] = environmentInfo{}
 		}
 	}
 
@@ -1579,9 +1625,25 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 			if env.Spec.Environment == "" || env.Spec.Name != environment.Spec.Name {
 				continue
 			}
-			envName := env.Spec.Environment
+			// An Environment that does not own its site must not post anything.
+			if env.Name != environment.Name && isDuplicateSite(env) {
+				continue
+			}
+			envName, _ := wave.Canonical(env.Spec.Environment)
 			if !relevantEnvironments[envName] {
 				continue
+			}
+			// Live ownership check: a stored condition may be stale, and a
+			// sibling must never post for a site another cluster owns.
+			if env.Name != environment.Name {
+				sibSelf, err := r.selfOwner(ctx, env)
+				if err != nil {
+					continue
+				}
+				sibConflict, err := r.findSiteConflict(ctx, ghClient, owner, repo, ensureKuberikPrefix(env.Spec.Name), env.Spec.Environment, r.effectiveSite(env), sibSelf)
+				if err != nil || sibConflict != nil {
+					continue
+				}
 			}
 
 			// Always sync this environment's history to ensure GitHub deployments and statuses
@@ -1602,25 +1664,11 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 
 			// Re-fetch deployments after syncing to get the latest status
 			// Fetch all pages to ensure we get all deployments (not just the first page)
-			formattedEnv := formatDeploymentEnvironment(deploymentName, envName)
-			task := formatDeploymentTask(deploymentName)
-			allDeploymentsForEnv := make([]*github.Deployment, 0)
-			opts := &github.DeploymentsListOptions{
-				Task:        task,
-				Environment: formattedEnv,
-				ListOptions: github.ListOptions{PerPage: 100}, // Fetch up to 100 per page
+			allDeploymentsForEnv, err := r.listTierDeployments(ctx, ghClient, owner, repo, formatDeploymentTask(deploymentName), deploymentName, envName)
+			if err != nil {
+				allDeploymentsForEnv = nil
 			}
-			for {
-				deployments, resp, err := ghClient.Repositories.ListDeployments(ctx, owner, repo, opts)
-				if err != nil {
-					break
-				}
-				allDeploymentsForEnv = append(allDeploymentsForEnv, deployments...)
-				if resp.NextPage == 0 {
-					break
-				}
-				opts.Page = resp.NextPage
-			}
+			allDeploymentsForEnv = r.displayDeployments(ctx, ghClient, owner, repo, envName, allDeploymentsForEnv, ownSites)
 			envDeployments[envName] = allDeploymentsForEnv
 
 			if len(allDeploymentsForEnv) == 0 {
@@ -1691,7 +1739,7 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 		}
 	}
 
-	return &relationshipGraphData{
+	return &environmentGraphData{
 		relevantEnvironments:  relevantEnvironments,
 		relevantVersions:      relevantVersions,
 		envDeployments:        envDeployments,
@@ -1701,143 +1749,29 @@ func (r *GitHubEnvironmentReconciler) buildRelationshipGraph(ctx context.Context
 	}, nil
 }
 
-// updateAllowedVersionsFromRelationships checks environment relationships and updates allowed versions on RolloutGate.
-// The related environment's history (synced from GitHub deployments) decides which versions pass,
-// depending on the relationship type (see relationshipAllowsBakeStatus).
-//
-// The gate is an allow list that the Rollout consults only when it picks its next version, which
-// has some consequences for "Alongside":
-//   - If the related environment's deployment of a version fails or is cancelled after this
-//     environment has started deploying it, the version drops out of the allow list, but this
-//     environment's deployment keeps going and is judged by its own bake and health checks.
-//   - Rollbacks on the related environment don't propagate. The Rollout only moves to release
-//     candidates newer than what it runs, so an older version being allowed changes nothing.
-func (r *GitHubEnvironmentReconciler) updateAllowedVersionsFromRelationships(ctx context.Context, environment *kuberikv1alpha1.Environment) error {
-	// Get the referenced Rollout to access releaseCandidates
-	rollout, err := r.getReferencedRollout(ctx, environment)
-	if err != nil {
-		return fmt.Errorf("failed to get referenced Rollout: %w", err)
+// directlyConnected reports whether tier envName is the current Environment's tier
+// or the nearest tier before or after it among the tiers present in infos.
+func directlyConnected(current, envName string, infos map[string]environmentInfo) bool {
+	cur, _ := wave.Canonical(current)
+	if envName == cur {
+		return true
 	}
-
-	// Build a map of revision -> tag from releaseCandidates
-	revisionToTag := make(map[string]string)
-	for _, candidate := range rollout.Status.ReleaseCandidates {
-		if candidate.Revision != nil && *candidate.Revision != "" && candidate.Tag != "" {
-			revisionToTag[*candidate.Revision] = candidate.Tag
-		}
-	}
-
-	// Initialize as empty slice (not nil) when relationship is set
-	// This ensures allowedVersions is set to empty array instead of nil
-	allowedTags := []string{}
-	seenTags := make(map[string]bool) // Avoid duplicates
-
-	// Find allowed versions from related environment history
-	if environment.Spec.Relationship != nil {
-		relatedEnvName := environment.Spec.Relationship.Environment
-
-		// Find related environment info in Status
-		var relatedEnvInfo *kuberikv1alpha1.EnvironmentInfo
-		if environment.Status.EnvironmentInfos != nil {
-			for i := range environment.Status.EnvironmentInfos {
-				// Use 'info' to access the element without copying if possible, but range returns copy
-				if environment.Status.EnvironmentInfos[i].Environment == relatedEnvName {
-					relatedEnvInfo = &environment.Status.EnvironmentInfos[i]
-					break
-				}
-			}
-		}
-
-		// Check if related environment has history
-		if relatedEnvInfo != nil {
-			for _, entry := range relatedEnvInfo.History {
-				if entry.Version.Revision == nil || *entry.Version.Revision == "" {
-					continue
-				}
-				revision := *entry.Version.Revision
-
-				// Since we now have consolidated history in Status with latest bake status (from GitHub),
-				// checking the entry's BakeStatus is sufficient.
-				if relationshipAllowsBakeStatus(environment.Spec.Relationship.Type, entry.BakeStatus) {
-					// Match revision to tag in releaseCandidates
-					if tag, found := revisionToTag[revision]; found {
-						// Only add if not already seen
-						if !seenTags[tag] {
-							allowedTags = append(allowedTags, tag)
-							seenTags[tag] = true
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Update allowed versions on RolloutGate (only if relationship is set)
-	if environment.Spec.Relationship == nil {
-		// No relationship, skip RolloutGate update
-		return nil
-	} else if environment.Status.RolloutGateRef == nil {
-		return nil
-	} else {
-		rolloutGate := &kuberikrolloutv1alpha1.RolloutGate{}
-		err = r.Get(ctx, types.NamespacedName{
-			Name:      environment.Status.RolloutGateRef.Name,
-			Namespace: environment.Namespace,
-		}, rolloutGate)
-		if err != nil {
-			return fmt.Errorf("failed to get RolloutGate: %w", err)
-		}
-
-		// Check if allowedVersions need to be updated
-		// When dependencies are set, we must ensure allowedVersions is set to empty array instead of nil
-		needsUpdate := false
-		if rolloutGate.Spec.AllowedVersions == nil {
-			// If currently nil and dependencies are set, we need to set it to empty array
-			needsUpdate = true
-		} else {
-			// Compare current values with new values
-			currentAllowedVersions := *rolloutGate.Spec.AllowedVersions
-			if !r.slicesEqual(currentAllowedVersions, allowedTags) {
-				needsUpdate = true
-			}
-		}
-
-		if needsUpdate {
-			rolloutGate.Spec.AllowedVersions = &allowedTags
-			if err := r.Update(ctx, rolloutGate); err != nil {
-				return fmt.Errorf("failed to update RolloutGate allowedVersions: %w", err)
-			}
-		}
-	}
-
-	return nil
-}
-
-// relationshipAllowsBakeStatus reports whether a version whose deployment on the related environment
-// has the given bake status may pass this environment's gate.
-func relationshipAllowsBakeStatus(relType kuberikv1alpha1.RelationshipType, bakeStatus *string) bool {
-	if bakeStatus == nil {
+	rc, re := wave.Rank(cur), wave.Rank(envName)
+	if rc < 0 || re < 0 {
 		return false
 	}
-	switch relType {
-	case kuberikv1alpha1.RelationshipTypeAlongside:
-		// The related environment has started deploying the version and it hasn't failed there
-		switch *bakeStatus {
-		case kuberikrolloutv1alpha1.BakeStatusDeploying,
-			kuberikrolloutv1alpha1.BakeStatusInProgress,
-			kuberikrolloutv1alpha1.BakeStatusSucceeded:
-			return true
+	lo, hi := min(rc, re), max(rc, re)
+	for name := range infos {
+		if r := wave.Rank(name); r > lo && r < hi {
+			return false
 		}
-		return false
-	default:
-		// After, and any type this controller doesn't know (see normalizeRelationship)
-		return *bakeStatus == kuberikrolloutv1alpha1.BakeStatusSucceeded
 	}
+	return true
 }
 
 // updateEnvironmentInfoWithHistory updates or adds an EnvironmentInfo entry to the list
 // It ensures that history entries are sorted descending by ID
-func updateEnvironmentInfoWithHistory(infos []kuberikv1alpha1.EnvironmentInfo, environment, environmentURL string, relationship *kuberikv1alpha1.EnvironmentRelationship, history []kuberikrolloutv1alpha1.DeploymentHistoryEntry) []kuberikv1alpha1.EnvironmentInfo {
+func updateEnvironmentInfoWithHistory(infos []kuberikv1alpha1.EnvironmentInfo, environment, environmentURL string, history []kuberikrolloutv1alpha1.DeploymentHistoryEntry) []kuberikv1alpha1.EnvironmentInfo {
 	var historyCopy []kuberikrolloutv1alpha1.DeploymentHistoryEntry
 	if history != nil {
 		// Deep copy
@@ -1874,7 +1808,6 @@ func updateEnvironmentInfoWithHistory(infos []kuberikv1alpha1.EnvironmentInfo, e
 	for i := range infos {
 		if infos[i].Environment == environment {
 			infos[i].EnvironmentURL = environmentURL
-			infos[i].Relationship = relationship
 			if history != nil {
 				infos[i].History = historyCopy
 			}
@@ -1886,7 +1819,6 @@ func updateEnvironmentInfoWithHistory(infos []kuberikv1alpha1.EnvironmentInfo, e
 	infos = append(infos, kuberikv1alpha1.EnvironmentInfo{
 		Environment:    environment,
 		EnvironmentURL: environmentURL,
-		Relationship:   relationship,
 		History:        historyCopy,
 	})
 	return infos
@@ -2004,18 +1936,6 @@ func environmentInfosEqual(a, b []kuberikv1alpha1.EnvironmentInfo) bool {
 		if aEntry.EnvironmentURL != bEntry.EnvironmentURL {
 			return false
 		}
-		// Compare relationships
-		if (aEntry.Relationship == nil) != (bEntry.Relationship == nil) {
-			return false
-		}
-		if aEntry.Relationship != nil && bEntry.Relationship != nil {
-			if aEntry.Relationship.Environment != bEntry.Relationship.Environment {
-				return false
-			}
-			if aEntry.Relationship.Type != bEntry.Relationship.Type {
-				return false
-			}
-		}
 		// Compare history
 		if !historyEntriesEqual(aEntry.History, bEntry.History) {
 			return false
@@ -2075,4 +1995,20 @@ func (r *GitHubEnvironmentReconciler) slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// stampPayload stamps site, wave, lockstep, selection and owner on a new
+// deployment payload.
+func (r *GitHubEnvironmentReconciler) stampPayload(p *deploymentPayload, env *kuberikv1alpha1.Environment, site string, self deploymentOwner) {
+	p.Site = site
+	p.Wave = r.effectiveWave(env)
+	p.Lockstep = env.Spec.Lockstep
+	p.Selection = isWaveLeader(env, site)
+	p.Owner = &self
+}
+
+// canonicalEnv is the canonical tier name of an environment name.
+func canonicalEnv(name string) string {
+	c, _ := wave.Canonical(name)
+	return c
 }

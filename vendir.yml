@@ -10,6 +10,13 @@ directories:
         includePaths:
           - config/crd/bases/*
         newRootPath: config/crd/bases
+      - path: release-controller
+        git:
+          url: https://github.com/kuberik/release-controller
+          ref: 77a5ffe
+        includePaths:
+          - config/crd/bases/*
+        newRootPath: config/crd/bases
       - path: gateway-api
         git:
           url: https://github.com/kubernetes-sigs/gateway-api

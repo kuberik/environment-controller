@@ -1628,7 +1628,13 @@ var _ = Describe("Environment Controller", func() {
 			_ = k8sClient.Delete(context.Background(), rollout)
 			Expect(k8sClient.Create(context.Background(), rollout)).Should(Succeed())
 
+			cands, src, err := publishCatalogue(context.Background(), k8sClient, DeploymentNamespace, "deps-src", []kuberikrolloutv1alpha1.VersionInfo{
+				{Tag: stagingTag, Revision: &stagingRef},
+			})
+			Expect(err).NotTo(HaveOccurred())
 			rollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
+				Candidates:    cands,
+				ReleaseSource: src,
 				History: []kuberikrolloutv1alpha1.DeploymentHistoryEntry{
 					{
 						ID: k8sptr.To(int64(1)),
@@ -1637,13 +1643,6 @@ var _ = Describe("Environment Controller", func() {
 							Revision: &revision,
 						},
 						Timestamp: metav1.Now(),
-					},
-				},
-				// Add releaseCandidates with revisions mapped to tags
-				ReleaseCandidates: []kuberikrolloutv1alpha1.VersionInfo{
-					{
-						Tag:      stagingTag,
-						Revision: &stagingRef,
 					},
 				},
 			}

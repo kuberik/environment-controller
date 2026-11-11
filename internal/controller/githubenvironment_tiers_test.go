@@ -168,10 +168,13 @@ var _ = Describe("Environment tiers", func() {
 			}
 			Expect(k8sClient.Create(ctx, rollout)).To(Succeed())
 			DeferCleanup(func() { Expect(k8sClient.Delete(ctx, rollout)).To(Succeed()) })
+			rels := make([]kuberikrolloutv1alpha1.VersionInfo, 0, 2)
 			for i, tag := range []string{"v1", "v2"} {
-				rollout.Status.ReleaseCandidates = append(rollout.Status.ReleaseCandidates,
-					kuberikrolloutv1alpha1.VersionInfo{Tag: tag, Revision: k8sptr.To("rev-" + string(rune('1'+i)))})
+				rels = append(rels, kuberikrolloutv1alpha1.VersionInfo{Tag: tag, Revision: k8sptr.To("rev-" + string(rune('1'+i)))})
 			}
+			var err error
+			rollout.Status.Candidates, rollout.Status.ReleaseSource, err = publishCatalogue(ctx, k8sClient, namespace, name+"-src", rels)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			env := &kuberikv1alpha1.Environment{

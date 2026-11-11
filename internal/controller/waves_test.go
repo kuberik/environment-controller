@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -16,10 +17,12 @@ import (
 
 	"github.com/google/go-github/v62/github"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
@@ -32,6 +35,7 @@ import (
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
 	"github.com/kuberik/environment-controller/internal/wave"
+	releasev1alpha1 "github.com/kuberik/release-controller/api/v1alpha1"
 	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 )
 
@@ -94,14 +98,13 @@ var _ = Describe("Sites and waves", func() {
 			Spec:       kuberikrolloutv1alpha1.RolloutSpec{ReleasesImagePolicy: corev1.LocalObjectReference{Name: "p"}},
 		}
 		Expect(k8sClient.Create(ctx, ro)).To(Succeed())
-		ro.Status = kuberikrolloutv1alpha1.RolloutStatus{
-			History: history,
-			ReleaseCandidates: []kuberikrolloutv1alpha1.VersionInfo{
-				{Tag: "v1", Revision: k8sptr.To(wRevA)},
-				{Tag: "v2", Revision: k8sptr.To(wRevB)},
-				{Tag: "v3", Revision: k8sptr.To(wRevC)},
-			},
-		}
+		cands, src, err := publishCatalogue(ctx, k8sClient, ns, "src", []kuberikrolloutv1alpha1.VersionInfo{
+			{Tag: "v1", Revision: k8sptr.To(wRevA)},
+			{Tag: "v2", Revision: k8sptr.To(wRevB)},
+			{Tag: "v3", Revision: k8sptr.To(wRevC)},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		ro.Status = kuberikrolloutv1alpha1.RolloutStatus{History: history, Candidates: cands, ReleaseSource: src}
 		Expect(k8sClient.Status().Update(ctx, ro)).To(Succeed())
 		return ro
 	}
@@ -971,24 +974,135 @@ func decodedPayload(raw json.RawMessage) []byte {
 
 func base64Decode(s string) ([]byte, error) { return base64.StdEncoding.DecodeString(s) }
 
-func TestCandidatesOfIncludesDeployedRelease(t *testing.T) {
-	rev := func(s string) *string { return &s }
-	r := &kuberikrolloutv1alpha1.Rollout{}
-	r.Status.AvailableReleases = []kuberikrolloutv1alpha1.VersionInfo{
-		{Tag: "v0", Revision: rev("000")},
-		{Tag: "v1", Revision: rev("aaa")},
-		{Tag: "v2", Revision: rev("bbb")},
+func candidatesTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	sch := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{kuberikrolloutv1alpha1.AddToScheme, releasev1alpha1.AddToScheme} {
+		if err := add(sch); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// The running version (v1) is not a release candidate.
-	r.Status.ReleaseCandidates = []kuberikrolloutv1alpha1.VersionInfo{
-		{Tag: "v2", Revision: rev("bbb")},
+	return sch
+}
+
+func candidatesTestRollout() *kuberikrolloutv1alpha1.Rollout {
+	rev := func(s string) *string { return &s }
+	r := &kuberikrolloutv1alpha1.Rollout{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns"}}
+	// v1 runs now, so it is not a candidate; v3 is blocked by a gate.
+	r.Status.ReleaseSource = &kuberikrolloutv1alpha1.ReleaseSourceStatusRef{Name: "src", Ready: true}
+	r.Status.Candidates = []kuberikrolloutv1alpha1.ReleaseCandidate{
+		{Tag: "v2", Gated: true},
+		{Tag: "v3", Gated: false, BlockedBy: []string{"soak"}},
 	}
 	r.Status.History = []kuberikrolloutv1alpha1.DeploymentHistoryEntry{
 		{Version: kuberikrolloutv1alpha1.VersionInfo{Tag: "v1", Revision: rev("aaa")}},
 	}
-	c := candidatesOf(r)
-	if c["aaa"] != "v1" || c["bbb"] != "v2" || len(c) != 2 {
-		t.Fatalf("candidatesOf = %v, want aaa->v1, bbb->v2 only", c)
+	return r
+}
+
+func candidatesTestSlice() *releasev1alpha1.ReleaseSlice {
+	rev := func(s string) *string { return &s }
+	now := metav1.Now()
+	return &releasev1alpha1.ReleaseSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "src-00000", Namespace: "ns", Labels: map[string]string{releasev1alpha1.ReleaseSourceLabel: "src"}},
+		Source:     "src",
+		Releases: []releasev1alpha1.Release{
+			{Tag: "v1", Revision: rev("aaa"), Sequence: 1, Created: now, FirstSeen: now},
+			{Tag: "v2", Revision: rev("bbb"), Sequence: 2, Created: now, FirstSeen: now},
+			{Tag: "v3", Revision: rev("ccc"), Sequence: 3, Created: now, FirstSeen: now},
+			{Tag: "vx", Revision: rev("xxx"), Sequence: 4, Created: now, FirstSeen: now},
+		},
+	}
+}
+
+// status.candidates alone, resolved through the slice catalogue: gated and
+// blocked candidates are both mapped, the running release comes from history,
+// and a release that is in the catalogue but not a candidate is not.
+func TestCandidatesOfResolvesThroughSlices(t *testing.T) {
+	sch := candidatesTestScheme(t)
+	r := &GitHubEnvironmentReconciler{Client: fakeclient.NewClientBuilder().WithScheme(sch).WithObjects(candidatesTestSlice()).Build()}
+	c, err := r.candidatesOf(context.Background(), candidatesTestRollout())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"aaa": "v1", "bbb": "v2", "ccc": "v3"}
+	if !equality.Semantic.DeepEqual(c, want) {
+		t.Fatalf("candidatesOf = %v, want %v", c, want)
+	}
+}
+
+// The deprecated lists are ignored even when present and different.
+func TestCandidatesOfIgnoresDeprecatedLists(t *testing.T) {
+	sch := candidatesTestScheme(t)
+	r := &GitHubEnvironmentReconciler{Client: fakeclient.NewClientBuilder().WithScheme(sch).WithObjects(candidatesTestSlice()).Build()}
+	ro := candidatesTestRollout()
+	stale := []kuberikrolloutv1alpha1.VersionInfo{{Tag: "old", Revision: k8sptr.To("ooo")}}
+	//nolint:staticcheck // the test proves the deprecated lists are ignored
+	ro.Status.ReleaseCandidates, ro.Status.AvailableReleases, ro.Status.GatedReleaseCandidates = stale, stale, stale
+	c, err := r.candidatesOf(context.Background(), ro)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c["ooo"]; ok || len(c) != 3 {
+		t.Fatalf("candidatesOf = %v, want only the three from candidates and history", c)
+	}
+	// Without status.candidates nothing but history[0] remains.
+	ro.Status.Candidates, ro.Status.ReleaseSource = nil, nil
+	c, err = r.candidatesOf(context.Background(), ro)
+	if err != nil || len(c) != 1 || c["aaa"] != "v1" {
+		t.Fatalf("candidatesOf = %v, %v; want only aaa->v1", c, err)
+	}
+}
+
+// With the ReleaseSlice kind not served, candidatesOf reports it and the
+// reconcile path turns that into a WaveReady=False condition.
+func TestCandidatesOfCatalogueAbsent(t *testing.T) {
+	sch := candidatesTestScheme(t)
+	noMatch := &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "kuberik.com", Kind: "ReleaseSlice"}}
+	c := fakeclient.NewClientBuilder().WithScheme(sch).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error { return noMatch },
+	}).Build()
+	r := &GitHubEnvironmentReconciler{Client: c}
+	if _, err := r.candidatesOf(context.Background(), candidatesTestRollout()); !errors.Is(err, errCatalogueUnavailable) {
+		t.Fatalf("err = %v, want errCatalogueUnavailable", err)
+	}
+
+	env := &kuberikv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", Generation: 3}}
+	sch2 := candidatesTestScheme(t)
+	if err := kuberikv1alpha1.AddToScheme(sch2); err != nil {
+		t.Fatal(err)
+	}
+	r2 := &GitHubEnvironmentReconciler{Client: fakeclient.NewClientBuilder().WithScheme(sch2).WithObjects(env).WithStatusSubresource(env).Build()}
+	if err := r2.setWaveUnresolved(context.Background(), env, errCatalogueUnavailable); err != nil {
+		t.Fatal(err)
+	}
+	got := &kuberikv1alpha1.Environment{}
+	if err := r2.Get(context.Background(), client.ObjectKeyFromObject(env), got); err != nil {
+		t.Fatal(err)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, ConditionWaveReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonCandidatesUnresolved {
+		t.Fatalf("WaveReady = %+v", cond)
+	}
+}
+
+// A ReleaseSlice change enqueues the Environments of Rollouts on that source.
+func TestReleaseSliceToEnvironments(t *testing.T) {
+	sch := candidatesTestScheme(t)
+	if err := kuberikv1alpha1.AddToScheme(sch); err != nil {
+		t.Fatal(err)
+	}
+	other := candidatesTestRollout()
+	other.Name, other.Status.ReleaseSource.Name = "other", "elsewhere"
+	envFor := func(name, rollout string) *kuberikv1alpha1.Environment {
+		return &kuberikv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"},
+			Spec: kuberikv1alpha1.EnvironmentSpec{RolloutRef: corev1.LocalObjectReference{Name: rollout}}}
+	}
+	r := &GitHubEnvironmentReconciler{Client: fakeclient.NewClientBuilder().WithScheme(sch).
+		WithObjects(candidatesTestRollout(), other, envFor("e1", "r"), envFor("e2", "other")).Build()}
+	reqs := r.releaseSliceToEnvironments(context.Background(), candidatesTestSlice())
+	if len(reqs) != 1 || reqs[0].Name != "e1" {
+		t.Fatalf("requests = %v, want only e1", reqs)
 	}
 }
 

@@ -38,6 +38,7 @@ import (
 	v1 "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/prow/pkg/ghcache"
 
+	releasev1alpha1 "github.com/kuberik/release-controller/api/v1alpha1"
 	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
@@ -56,6 +57,7 @@ func init() {
 	utilruntime.Must(kuberikv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 	utilruntime.Must(kuberikrolloutv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(releasev1alpha1.AddToScheme(scheme))
 	utilruntime.Must(v1.Install(scheme))
 }
 
@@ -203,6 +205,7 @@ func main() {
 		APIReader:               mgr.GetAPIReader(),
 		DefaultSite:             defaultSite,
 		MaxConcurrentReconciles: maxConcurrentReconciles,
+		//nolint:staticcheck // reconciler uses the record.EventRecorder API; migration is separate
 		Recorder:                mgr.GetEventRecorderFor("environment-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Environment")

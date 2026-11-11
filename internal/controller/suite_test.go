@@ -35,6 +35,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
+	releasev1alpha1 "github.com/kuberik/release-controller/api/v1alpha1"
 	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 )
 
@@ -58,6 +59,7 @@ var _ = BeforeSuite(func() {
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths: []string{
 			filepath.Join("..", "..", "vendir", "crds", "rollout-controller"),
+			filepath.Join("..", "..", "vendir", "crds", "release-controller"),
 			filepath.Join("..", "..", "vendir", "crds", "gateway-api"),
 			filepath.Join("..", "..", "config", "crd", "bases"),
 		},
@@ -75,6 +77,9 @@ var _ = BeforeSuite(func() {
 	Expect(cfg).NotTo(BeNil())
 
 	err = kuberikrolloutv1alpha1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+
+	err = releasev1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	err = kuberikv1alpha1.AddToScheme(scheme.Scheme)

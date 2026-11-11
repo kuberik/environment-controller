@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,6 +39,7 @@ import (
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
 	"github.com/kuberik/environment-controller/internal/wave"
+	releasev1alpha1 "github.com/kuberik/release-controller/api/v1alpha1"
 	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 )
 
@@ -426,24 +429,58 @@ func newestDeployment(m wave.Member) (wave.Deployment, bool) {
 	return best, found
 }
 
-// candidatesOf maps revisions to tags: the Rollout's release candidates plus
-// the release it runs now. The rollout controller drops the running version
-// from releaseCandidates, so without it a site that is up to date with its
-// wave's selection would report WaitingForCandidate forever instead of Ready.
-// Only the running release is added (not every available release) so the
-// gate's allowedVersions stays short.
-func candidatesOf(rollout *kuberikrolloutv1alpha1.Rollout) map[string]string {
+// ReasonCandidatesUnresolved is the WaveReady reason when the release catalogue
+// cannot be read, so revisions cannot be mapped to tags.
+const ReasonCandidatesUnresolved = "CandidatesUnresolved"
+
+// errCatalogueUnavailable means the ReleaseSlice kind is not served.
+var errCatalogueUnavailable = errors.New("ReleaseSlice CRD is not served on this cluster")
+
+// candidatesOf maps revisions to tags: status.candidates (gated and blocked
+// alike) plus the release the Rollout runs now. status.candidates carries tags
+// only, so revisions are resolved from the ReleaseSlice catalogue of
+// status.releaseSource. The old releaseCandidates, availableReleases and
+// gatedReleaseCandidates lists are not read.
+//
+// Every candidate is mapped, not only the gated ones: the map is a translation
+// table from a GitHub revision to a tag, and the gate (allowedVersions) is what
+// decides eligibility. The old releaseCandidates list was likewise the
+// pre-gate list. The running release is added from history[0] because the
+// rollout controller excludes it from candidates, and a site that is up to
+// date with its wave's selection would otherwise report WaitingForCandidate
+// forever instead of Ready.
+func (r *GitHubEnvironmentReconciler) candidatesOf(ctx context.Context, rollout *kuberikrolloutv1alpha1.Rollout) (map[string]string, error) {
 	c := map[string]string{}
 	if h := rollout.Status.History; len(h) > 0 && h[0].Version.Revision != nil &&
 		*h[0].Version.Revision != "" && h[0].Version.Tag != "" {
 		c[*h[0].Version.Revision] = h[0].Version.Tag
 	}
-	for _, cand := range rollout.Status.ReleaseCandidates {
-		if cand.Revision != nil && *cand.Revision != "" && cand.Tag != "" {
-			c[*cand.Revision] = cand.Tag
+	if len(rollout.Status.Candidates) == 0 || rollout.Status.ReleaseSource == nil {
+		return c, nil
+	}
+	var slices releasev1alpha1.ReleaseSliceList
+	err := r.List(ctx, &slices, client.InNamespace(rollout.Namespace),
+		client.MatchingLabels{releasev1alpha1.ReleaseSourceLabel: rollout.Status.ReleaseSource.Name})
+	if err != nil {
+		if meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+			return nil, fmt.Errorf("%w: %v", errCatalogueUnavailable, err)
+		}
+		return nil, err
+	}
+	revByTag := map[string]string{}
+	for i := range slices.Items {
+		for _, rel := range slices.Items[i].Releases {
+			if rel.Revision != nil && *rel.Revision != "" {
+				revByTag[rel.Tag] = *rel.Revision
+			}
 		}
 	}
-	return c
+	for _, cand := range rollout.Status.Candidates {
+		if rev, ok := revByTag[cand.Tag]; ok {
+			c[rev] = cand.Tag
+		}
+	}
+	return c, nil
 }
 
 // currentRevision is the revision of the Rollout's newest history entry.
@@ -489,6 +526,14 @@ func (r *GitHubEnvironmentReconciler) reconcileWave(ctx context.Context, gh *git
 	if rollout.Spec.WantedVersion != nil {
 		pinned = *rollout.Spec.WantedVersion
 	}
+	candidates, err := r.candidatesOf(ctx, rollout)
+	if err != nil {
+		if errors.Is(err, errCatalogueUnavailable) {
+			// Not retryable by requeue alone; say so and leave the gate as is.
+			return r.setWaveUnresolved(ctx, env, err)
+		}
+		return err
+	}
 	in := wave.Input{
 		Self: wave.Self{
 			Environment:   self,
@@ -500,7 +545,7 @@ func (r *GitHubEnvironmentReconciler) reconcileWave(ctx context.Context, gh *git
 			PinnedVersion: pinned,
 		},
 		Members:    members,
-		Candidates: candidatesOf(rollout),
+		Candidates: candidates,
 		Current:    currentRevision(rollout),
 	}
 	dec := wave.Decide(in)
@@ -518,6 +563,20 @@ func (r *GitHubEnvironmentReconciler) reconcileWave(ctx context.Context, gh *git
 		allowed = &tags
 	}
 	return r.setGateAllowedVersions(ctx, env, allowed)
+}
+
+// setWaveUnresolved marks WaveReady False when candidates cannot be resolved.
+// The RolloutGate is left untouched.
+func (r *GitHubEnvironmentReconciler) setWaveUnresolved(ctx context.Context, env *kuberikv1alpha1.Environment, cause error) error {
+	before := env.Status.DeepCopy()
+	meta.SetStatusCondition(&env.Status.Conditions, metav1.Condition{
+		Type: ConditionWaveReady, Status: metav1.ConditionFalse, Reason: ReasonCandidatesUnresolved,
+		Message: cause.Error(), ObservedGeneration: env.Generation,
+	})
+	if equality.Semantic.DeepEqual(before.Conditions, env.Status.Conditions) {
+		return nil
+	}
+	return r.Status().Update(ctx, env)
 }
 
 // applyWaveStatus writes status.wave and the WaveReady / LockstepConsistent

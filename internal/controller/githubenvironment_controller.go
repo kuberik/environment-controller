@@ -33,8 +33,10 @@ import (
 	"github.com/google/go-github/v62/github"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	k8sptr "k8s.io/utils/ptr"
@@ -48,6 +50,7 @@ import (
 
 	kuberikv1alpha1 "github.com/kuberik/environment-controller/api/v1alpha1"
 	"github.com/kuberik/environment-controller/internal/wave"
+	releasev1alpha1 "github.com/kuberik/release-controller/api/v1alpha1"
 	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 )
 
@@ -150,6 +153,7 @@ type GitHubEnvironmentReconciler struct {
 // +kubebuilder:rbac:groups=environments.kuberik.com,resources=environments/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kuberik.com,resources=rolloutgates,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kuberik.com,resources=rollouts,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kuberik.com,resources=releaseslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
@@ -307,15 +311,56 @@ func (r *GitHubEnvironmentReconciler) controllerOptions() controllerruntimectrl.
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *GitHubEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&kuberikv1alpha1.Environment{}).
 		Watches(
 			&kuberikrolloutv1alpha1.Rollout{},
 			handler.EnqueueRequestsFromMapFunc(r.rolloutToEnvironment),
-		).
-		Named("environment").
+		)
+	// The ReleaseSlice catalogue is optional: watch it only when the kind is
+	// served, so the controller still starts without release-controller's CRDs.
+	// Waves then report CandidatesUnresolved instead.
+	if releaseSliceServed(mgr.GetRESTMapper()) {
+		b = b.Watches(
+			&releasev1alpha1.ReleaseSlice{},
+			handler.EnqueueRequestsFromMapFunc(r.releaseSliceToEnvironments),
+		)
+	} else {
+		ctrl.Log.WithName("setup").Info("ReleaseSlice CRD not served; not watching release catalogues")
+	}
+	return b.Named("environment").
 		WithOptions(r.controllerOptions()).
 		Complete(r)
+}
+
+func releaseSliceServed(mapper meta.RESTMapper) bool {
+	_, err := mapper.RESTMapping(schema.GroupKind{Group: releasev1alpha1.GroupVersion.Group, Kind: "ReleaseSlice"}, releasev1alpha1.GroupVersion.Version)
+	return err == nil
+}
+
+// releaseSliceToEnvironments maps a ReleaseSlice to the Environments whose
+// Rollout reads the slice's ReleaseSource, so a new build re-evaluates waves.
+func (r *GitHubEnvironmentReconciler) releaseSliceToEnvironments(ctx context.Context, obj client.Object) []reconcile.Request {
+	source := obj.GetLabels()[releasev1alpha1.ReleaseSourceLabel]
+	if source == "" {
+		return nil
+	}
+	var rollouts kuberikrolloutv1alpha1.RolloutList
+	if err := r.List(ctx, &rollouts, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range rollouts.Items {
+		ro := &rollouts.Items[i]
+		uses := ro.Spec.ReleaseSourceRef != nil && ro.Spec.ReleaseSourceRef.Name == source
+		if !uses && ro.Status.ReleaseSource != nil && ro.Status.ReleaseSource.Name == source {
+			uses = true
+		}
+		if uses {
+			requests = append(requests, r.rolloutToEnvironment(ctx, ro)...)
+		}
+	}
+	return requests
 }
 
 // rolloutToEnvironment maps a Rollout to all Environments that reference it

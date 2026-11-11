@@ -206,7 +206,7 @@ func main() {
 		DefaultSite:             defaultSite,
 		MaxConcurrentReconciles: maxConcurrentReconciles,
 		//nolint:staticcheck // reconciler uses the record.EventRecorder API; migration is separate
-		Recorder:                mgr.GetEventRecorderFor("environment-controller"),
+		Recorder: mgr.GetEventRecorderFor("environment-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Environment")
 		os.Exit(1)

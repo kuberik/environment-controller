@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/google/go-github/v62 v62.0.0
 	github.com/kuberik/release-controller v0.0.0-20261111074959-77a5ffec0a99
-	github.com/kuberik/rollout-controller v0.11.1-0.20261111073645-a38cdda54d10
+	github.com/kuberik/rollout-controller v0.11.1-0.20261111095404-d4e4d4abe390
 	github.com/onsi/ginkgo/v2 v2.27.2
 	github.com/onsi/gomega v1.38.2
 	golang.org/x/oauth2 v0.30.0

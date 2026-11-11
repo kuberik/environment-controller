@@ -1224,3 +1224,33 @@ func TestControllerOptionsConcurrency(t *testing.T) {
 		t.Fatalf("got %d, want 4", got)
 	}
 }
+
+// Lazy start: the watch is registered only once discovery serves the kind, with
+// no restart, and exactly once.
+func TestWatchWhenServedRegistersOnceCRDAppears(t *testing.T) {
+	var servedNow, registered atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchWhenServed(ctx, 5*time.Millisecond,
+			func() bool { return servedNow.Load() == 1 },
+			func() error { registered.Add(1); return nil })
+	}()
+	time.Sleep(60 * time.Millisecond)
+	if registered.Load() != 0 {
+		t.Fatal("registered while the CRD was absent")
+	}
+	servedNow.Store(1)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch not registered after the CRD appeared")
+	}
+	if registered.Load() != 1 {
+		t.Fatalf("registered %d times, want 1", registered.Load())
+	}
+}

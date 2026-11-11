@@ -188,8 +188,9 @@ type Input struct {
 	// (Self.Environment, Self.Wave) and overrides any recorded Wave/Lockstep for
 	// Self with the spec values.
 	Members []Member
-	// Candidates maps revision -> tag from the local Rollout's releaseCandidates
-	// plus the release the site runs now (so an up-to-date site maps too).
+	// Candidates maps revision -> tag for the local Rollout's status.candidates,
+	// resolved through its ReleaseSource catalogue, plus the release the site
+	// runs now (so an up-to-date site maps too).
 	Candidates map[string]string
 	// Current is the revision the local Rollout runs now ("" unknown). Only
 	// used to tell "up to date, waiting for the previous wave" from Ready.

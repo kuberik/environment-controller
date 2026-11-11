@@ -64,6 +64,15 @@ rules:
 - apiGroups:
   - kuberik.com
   resources:
+  - releaseslices
+  - rollouts
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kuberik.com
+  resources:
   - rolloutgates
   verbs:
   - create
@@ -72,14 +81,6 @@ rules:
   - list
   - patch
   - update
-  - watch
-- apiGroups:
-  - kuberik.com
-  resources:
-  - rollouts
-  verbs:
-  - get
-  - list
   - watch
 - apiGroups:
   - networking.k8s.io

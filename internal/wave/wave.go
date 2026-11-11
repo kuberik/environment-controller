@@ -78,7 +78,7 @@ limitations under the License.
 // of the environment, the leader's allowed set is pinned to the current
 // selection (LockstepWaiting). Consequences an operator must know: a failed
 // bake in any wave holds the whole environment on the failed revision, and if
-// the selected revision drops out of the leader's releaseCandidates the leader
+// the selected revision drops out of the leader's status.candidates the leader
 // stays blocked until it returns. Both are released by turning lockstep off or
 // pinning the leader's Rollout.
 //

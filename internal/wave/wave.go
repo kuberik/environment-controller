@@ -78,7 +78,7 @@ limitations under the License.
 // of the environment, the leader's allowed set is pinned to the current
 // selection (LockstepWaiting). Consequences an operator must know: a failed
 // bake in any wave holds the whole environment on the failed revision, and if
-// the selected revision drops out of the leader's releaseCandidates the leader
+// the selected revision drops out of the leader's status.candidates the leader
 // stays blocked until it returns. Both are released by turning lockstep off or
 // pinning the leader's Rollout.
 //
@@ -188,8 +188,9 @@ type Input struct {
 	// (Self.Environment, Self.Wave) and overrides any recorded Wave/Lockstep for
 	// Self with the spec values.
 	Members []Member
-	// Candidates maps revision -> tag from the local Rollout's releaseCandidates
-	// plus the release the site runs now (so an up-to-date site maps too).
+	// Candidates maps revision -> tag for the local Rollout's status.candidates,
+	// resolved through its ReleaseSource catalogue, plus the release the site
+	// runs now (so an up-to-date site maps too).
 	Candidates map[string]string
 	// Current is the revision the local Rollout runs now ("" unknown). Only
 	// used to tell "up to date, waiting for the previous wave" from Ready.

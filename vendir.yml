@@ -6,14 +6,14 @@ directories:
       - path: rollout-controller
         git:
           url: https://github.com/kuberik/rollout-controller
-          ref: main
+          ref: a38cdda54d10508a5b17df0012711832381c2e9e
         includePaths:
           - config/crd/bases/*
         newRootPath: config/crd/bases
       - path: release-controller
         git:
           url: https://github.com/kuberik/release-controller
-          ref: 77a5ffe
+          ref: 77a5ffec0a9983370e59c94c6434e9339e949d53
         includePaths:
           - config/crd/bases/*
         newRootPath: config/crd/bases

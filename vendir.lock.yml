@@ -2,11 +2,16 @@ apiVersion: vendir.k14s.io/v1alpha1
 directories:
 - contents:
   - git:
-      commitTitle: 'chore: release version v0.5.0'
-      sha: 5f83de35b4ee8d379e14a4938d2ccc8b75928f16
+      commitTitle: 'feat: a ref''d Rollout opts into the catalogue, drop --release-slices...'
+      sha: a38cdda54d10508a5b17df0012711832381c2e9e
       tags:
-      - v0.5.0
+      - v0.11.0-25-ga38cdda
     path: rollout-controller
+  - git:
+      commitTitle: 'fix: own leader-election lease; dev overlay runs the ko entrypoint
+        (#1)...'
+      sha: 77a5ffec0a9983370e59c94c6434e9339e949d53
+    path: release-controller
   - git:
       commitTitle: '[release-1.4] chore(1.4.1): CHANGELOG and version updates (#4318)...'
       sha: 477d172e6ac5eccb82b65781ddb8f924afec4170

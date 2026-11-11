@@ -1,0 +1,276 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.2
+  name: rolloutschedules.kuberik.com
+spec:
+  group: kuberik.com
+  names:
+    kind: RolloutSchedule
+    listKind: RolloutScheduleList
+    plural: rolloutschedules
+    singular: rolloutschedule
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.action
+      name: Action
+      type: string
+    - jsonPath: .status.active
+      name: Active
+      type: boolean
+    - jsonPath: .status.matchingRollouts
+      name: Matching
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: RolloutSchedule is the Schema for the rolloutschedules API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: RolloutScheduleSpec defines the desired state of RolloutSchedule.
+            properties:
+              action:
+                default: Deny
+                description: |-
+                  Action defines what to do when the schedule is active.
+                  - "Allow": Gate passes when active, blocks when inactive
+                  - "Deny": Gate blocks when active, passes when inactive
+                enum:
+                - Allow
+                - Deny
+                type: string
+              rolloutSelector:
+                description: RolloutSelector is a label selector to match Rollouts
+                  in the same namespace.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              rules:
+                description: |-
+                  Rules is a list of schedule rules.
+                  The schedule is active if ANY rule matches the current time/date.
+                items:
+                  description: |-
+                    ScheduleRule defines a time-based rule.
+                    The schedule is active if the current time/date matches this rule.
+                  properties:
+                    dateRange:
+                      description: DateRange restricts the rule to specific date range
+                      properties:
+                        end:
+                          description: End date in YYYY-MM-DD format
+                          pattern: ^\d{4}-\d{2}-\d{2}$
+                          type: string
+                        start:
+                          description: Start date in YYYY-MM-DD format
+                          pattern: ^\d{4}-\d{2}-\d{2}$
+                          type: string
+                      required:
+                      - end
+                      - start
+                      type: object
+                    daysOfWeek:
+                      description: DaysOfWeek restricts the rule to specific days
+                        of the week
+                      items:
+                        description: DayOfWeek represents a day of the week.
+                        enum:
+                        - Monday
+                        - Tuesday
+                        - Wednesday
+                        - Thursday
+                        - Friday
+                        - Saturday
+                        - Sunday
+                        type: string
+                      type: array
+                    name:
+                      description: Name is an optional identifier for this rule
+                      type: string
+                    timeRange:
+                      description: TimeRange restricts the rule to specific times
+                        of day
+                      properties:
+                        end:
+                          description: End time in HH:MM format (24-hour)
+                          pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                          type: string
+                        start:
+                          description: Start time in HH:MM format (24-hour)
+                          pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                          type: string
+                      required:
+                      - end
+                      - start
+                      type: object
+                  type: object
+                minItems: 1
+                type: array
+              timezone:
+                default: UTC
+                description: |-
+                  Timezone is the IANA timezone for the schedule (e.g., "America/New_York").
+                  Defaults to "UTC" if not specified.
+                type: string
+            required:
+            - rolloutSelector
+            - rules
+            type: object
+          status:
+            description: RolloutScheduleStatus defines the observed state of RolloutSchedule.
+            properties:
+              active:
+                description: Active indicates if the schedule is currently active
+                  (any rule matches).
+                type: boolean
+              activeRules:
+                description: ActiveRules is a list of rule names that are currently
+                  active.
+                items:
+                  type: string
+                type: array
+              conditions:
+                description: Conditions represents the current state of the schedule.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              managedGates:
+                description: ManagedGates is a list of RolloutGate names being managed
+                  by this schedule.
+                items:
+                  type: string
+                type: array
+              matchingRollouts:
+                description: MatchingRollouts is the count of rollouts currently matched
+                  by the selector.
+                type: integer
+              nextTransition:
+                description: NextTransition is the timestamp when the active state
+                  will next change.
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

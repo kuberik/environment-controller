@@ -1,0 +1,237 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.2
+  name: rolloutdependencies.kuberik.com
+spec:
+  group: kuberik.com
+  names:
+    kind: RolloutDependency
+    listKind: RolloutDependencyList
+    plural: rolloutdependencies
+    singular: rolloutdependency
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.rolloutRef.name
+      name: Rollout
+      type: string
+    - jsonPath: .spec.providerRef.name
+      name: Provider
+      type: string
+    - jsonPath: .status.providedVersion
+      name: Provided
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Satisfied")].status
+      name: Satisfied
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: RolloutDependency is the Schema for the rolloutdependencies API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of RolloutDependency
+            properties:
+              contract:
+                description: |-
+                  Contract is the contract name matched against the consumer's
+                  "com.kuberik.rollout.requires.<contract>" annotations.
+                  Defaults to the name of the provider Rollout.
+                type: string
+              providerRef:
+                description: ProviderRef references the Rollout that provides the
+                  contract.
+                properties:
+                  name:
+                    description: Name is the name of the providing Rollout.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the namespace of the providing Rollout.
+                      Defaults to the namespace of the RolloutDependency.
+                    type: string
+                required:
+                - name
+                type: object
+              rolloutRef:
+                description: |-
+                  RolloutRef references the consumer Rollout that this dependency gates.
+                  The Rollout must live in the same namespace as this RolloutDependency.
+
+                  The name is validated here because corev1.LocalObjectReference defaults it
+                  to the empty string, which would otherwise be admitted and then fail every
+                  lookup.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+                x-kubernetes-validations:
+                - message: rolloutRef.name must not be empty
+                  rule: self.name != ''
+            required:
+            - providerRef
+            - rolloutRef
+            type: object
+          status:
+            description: status defines the observed state of RolloutDependency
+            properties:
+              admittedVersions:
+                description: |-
+                  AdmittedVersions lists the consumer release candidate tags admitted by this
+                  dependency. This is the allow list published to the managed RolloutGate.
+                  Named for symmetry with RolloutGate.allowedVersions, which also holds tags.
+                  Capped at the newest entries; see maxPublishedReleases.
+                items:
+                  type: string
+                maxItems: 50
+                type: array
+              blockedReleases:
+                description: |-
+                  BlockedReleases lists the consumer release candidates held back by this
+                  dependency, with the constraint each places on the contract.
+                  Capped at the newest entries; see maxPublishedReleases.
+                items:
+                  description: |-
+                    BlockedRelease describes a consumer release candidate held back by this
+                    dependency, and why.
+                  properties:
+                    reason:
+                      description: Reason is a short, machine-readable reason the
+                        candidate is blocked.
+                      type: string
+                    requiredVersion:
+                      description: |-
+                        RequiredVersion is the version constraint the candidate places on the
+                        provider's contract, verbatim from its requires annotation.
+                      type: string
+                    tag:
+                      description: Tag is the image tag of the blocked release candidate.
+                      type: string
+                  required:
+                  - tag
+                  type: object
+                maxItems: 50
+                type: array
+              conditions:
+                description: |-
+                  conditions represent the current state of the RolloutDependency resource.
+
+                  Condition types:
+                  - "Ready": the dependency was evaluated and its gate is in sync
+                  - "Satisfied": no release the consumer could deploy next is held back by
+                    this dependency
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              gateName:
+                description: GateName is the name of the RolloutGate managed by this
+                  dependency.
+                type: string
+              providedTag:
+                description: |-
+                  ProvidedTag is the image tag of the provider release that ProvidedVersion
+                  was read from.
+                type: string
+              providedVersion:
+                description: |-
+                  ProvidedVersion is the contract version currently deployed by the provider
+                  Rollout, taken from the OCI version annotation of its deployed release with
+                  the numeric per-build ordinal stripped. A real pre-release identifier
+                  ("2.0.0-alpha.1") is preserved, because it means the triple has not
+                  shipped.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

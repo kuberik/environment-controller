@@ -46,7 +46,6 @@ spec:
   # Environment configuration
   name: "kuberik-myapp-production"
   environment: "prod"
-  ref: "main"
 
   # Optional: which cluster instance this is, and its rollout wave
   site: "eu-west-1"   # defaults to the controller's default site, then "default"
@@ -73,7 +72,6 @@ spec:
 
 ### Optional Fields
 
-- `ref`: Git reference (branch, tag, or SHA) - defaults to the revision from Rollout history
 - `site`: Name of this cluster's instance of the environment (see [Sites and waves](#sites-and-waves)). Defaults to the controller's default site, then `default`.
 - `wave`: 1-based wave of this site inside its environment. Defaults to 1.
 - `lockstep`: See [Lockstep](#lockstep).
@@ -348,7 +346,6 @@ type EnvironmentSpec struct {
     RolloutRef       corev1.LocalObjectReference `json:"rolloutRef"`
     Name             string                      `json:"name"`
     Environment      string                      `json:"environment"` // dev|development|test|qa|staging|stage|preprod|prod|production
-    Ref              string                      `json:"ref,omitempty"`
     Relationship     *EnvironmentRelationship    `json:"relationship,omitempty"` // deprecated, ignored
     Site             string                      `json:"site,omitempty"`
     Wave             *int32                      `json:"wave,omitempty"`
@@ -378,10 +375,12 @@ type EnvironmentRelationship struct {
 
 ```go
 type EnvironmentStatus struct {
-    DeploymentID      *int64                    `json:"deploymentId,omitempty"`
-    DeploymentURL     string                    `json:"deploymentUrl,omitempty"`
-    DeploymentStatuses []EnvironmentStatusEntry  `json:"deploymentStatuses,omitempty"`
-    EnvironmentInfos  []EnvironmentInfo         `json:"environmentInfos,omitempty"`
+    LastStatusChangeTime *metav1.Time                `json:"lastStatusChangeTime,omitempty"`
+    CurrentVersion       string                      `json:"currentVersion,omitempty"`
+    RolloutGateRef       *corev1.LocalObjectReference `json:"rolloutGateRef,omitempty"`
+    EnvironmentInfos     []EnvironmentInfo           `json:"environmentInfos,omitempty"`
+    Wave                 *WaveStatus                 `json:"wave,omitempty"`
+    Conditions           []metav1.Condition          `json:"conditions,omitempty"`
 }
 ```
 
